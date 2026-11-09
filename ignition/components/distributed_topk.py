@@ -11,6 +11,41 @@ from .candidate_merge import PreparedCandidateMerge
 from .collectives import PreparedAllGather
 
 
+def _launch(kernel, grid, arguments, **metadata):
+    from torch.fx.experimental.proxy_tensor import get_proxy_mode
+
+    if torch.compiler.is_compiling() or get_proxy_mode() is not None:
+        torch.library.wrap_triton(kernel)[grid](*arguments, **metadata)
+    else:
+        kernel[grid](*arguments, **metadata)
+
+
+@triton.jit
+def _pack_candidates(Indices, Scores, Packed, Rank, row_stride,
+                     TOPK: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
+    # One packed slot pair per candidate: the score bits, and the global position bits of a
+    # live candidate. Unavailable candidates carry -inf and -1, as the merge expects.
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    rank = tl.load(Rank).to(tl.int32)
+    columns = block * BLOCK + tl.arange(0, BLOCK)
+    mask = columns < TOPK
+    index = tl.load(Indices + row * row_stride + columns, mask=mask, other=-1)
+    score = tl.load(Scores + row * row_stride + columns, mask=mask, other=0.0)
+    live = index >= 0
+    slot = Packed + row * (2 * row_stride) + 2 * columns
+    tl.store(slot, tl.where(live, score.to(tl.int32, bitcast=True), -8388608), mask=mask)
+    tl.store(slot + 1, tl.where(live, index * WORLD + rank, -1), mask=mask)
+
+
+def _pack_local_candidates(indices, scores, local, rank, world):
+    """Write this rank's candidate score/global-position pairs for the all-gather."""
+    rows, topk = indices.shape
+    _launch(_pack_candidates, (rows, triton.cdiv(topk, 1024)),
+            (indices, scores, local.view(torch.int32), rank, indices.stride(0)),
+            TOPK=topk, WORLD=world, BLOCK=1024, num_warps=4)
+
+
 class PreparedDistributedTopK:
     """Merge each rank's local top-k into global logical positions.
 
@@ -38,10 +73,7 @@ class PreparedDistributedTopK:
             coordinator=coordinator, name=name)
 
     def __call__(self):
-        live = self.indices >= 0
-        self.local[:, :, 0].copy_(torch.where(live, self.scores, -torch.inf))
-        self.local.view(torch.int32)[:, :, 1].copy_(
-            torch.where(live, self.indices.long() * self.world + self.rank, -1))
+        _pack_local_candidates(self.indices, self.scores, self.local, self.rank, self.world)
         self.collective(self.local.view(torch.bfloat16).view(self.indices.shape[0], -1))
         self.merge()
         return self.output
@@ -75,19 +107,30 @@ def _records(Selected, Positions, Pages, Rank, Output, Counts,
     tl.store(Counts + row, count)
 
 
-def selected_local_records(selected, positions, pages, *, world, rank, page_size):
+def selected_local_records(selected, positions, pages, *, world, rank, page_size, output=None, counts=None):
     """Compact selected global positions into this rank's physical records.
 
     ``pages`` is a model-page table per query row. The selected positions are independently
-    bounded by that row's causal position; negative positions denote inactive rows.
+    bounded by that row's causal position; negative positions denote inactive rows. Callers may
+    pass contiguous int32 ``output`` and ``counts`` buffers to skip a staging copy.
     """
-    output = torch.empty_like(selected, memory_format=torch.contiguous_format)
-    count = torch.empty((selected.shape[0],), dtype=torch.int32, device=selected.device)
+    if output is None:
+        output = torch.empty_like(selected, memory_format=torch.contiguous_format)
+    elif (output.shape != selected.shape or output.dtype != selected.dtype
+          or not output.is_contiguous() or output.device != selected.device):
+        raise ValueError("record mapper output must be a contiguous selection-shaped int32 buffer")
+    if counts is None:
+        count = torch.empty((selected.shape[0],), dtype=torch.int32, device=selected.device)
+    elif (counts.shape != (selected.shape[0],) or counts.dtype != torch.int32
+          or not counts.is_contiguous() or counts.device != selected.device):
+        raise ValueError("record mapper counts must be a contiguous int32 row buffer")
+    else:
+        count = counts
     tensor_rank = isinstance(rank, torch.Tensor)
-    torch.library.wrap_triton(_records)[(selected.shape[0],)](
+    _launch(_records, (selected.shape[0],), (
         selected, positions, pages, rank if tensor_rank else positions, output, count,
         *selected.stride(), positions.stride(0), *pages.stride(),
         selected.shape[1], pages.shape[1], world, page_size,
         triton.next_power_of_2(selected.shape[1]), tensor_rank,
-        0 if tensor_rank else rank, num_warps=8)
+        0 if tensor_rank else rank), num_warps=8)
     return output, count
