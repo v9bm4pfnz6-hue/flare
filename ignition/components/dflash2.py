@@ -21,6 +21,26 @@ from ignition.components.window_staging import PreparedWindowStaging
 PAGE_TOKENS = 128
 
 
+def finalize_vocabulary_logits(gathered_logits, logits, vocab, *, multiplier, softcap):
+    """Write the unary-transformed FP32 vocabulary logits from gathered rows.
+
+    ``gathered_logits`` holds BF16 output-partitioned head rows and ``logits``
+    owns the FP32 vocabulary rows consumed by the selector and proposal
+    samplers. The final multiply writes into ``logits`` directly, so the
+    transformed values are not staged through a second full-vocabulary buffer.
+    The arithmetic is the same FP32 multiply, optional softcap divide, tanh and
+    rescale on the same converted rows.
+    """
+    if logits.shape != (gathered_logits.shape[0], vocab):
+        raise ValueError("vocabulary logits must own one FP32 row per gathered row")
+    values = gathered_logits[:, :vocab].float()
+    if softcap is None:
+        torch.mul(values, multiplier, out=logits)
+    else:
+        unary = torch.mul(values, multiplier)
+        torch.mul((unary / softcap).tanh(), softcap, out=logits)
+
+
 def _norm(weight, eps):
     with torch.device("meta"):
         module = Qwen3RMSNorm(weight.numel(), eps=eps)
@@ -316,8 +336,8 @@ class PreparedDraft:
         s.hidden.copy_(self.norm(s.embedding[self.metadata.sample_indices]))
         self.head(s.hidden)
         # The unary transform consumes the head result in FP32.
-        unary = s.gathered_logits[:, :c.text["vocab_size"]].float() * self.multiplier
-        s.logits.copy_(unary if self.softcap is None else (unary / self.softcap).tanh() * self.softcap)
+        finalize_vocabulary_logits(s.gathered_logits, s.logits, c.text["vocab_size"],
+                                   multiplier=self.multiplier, softcap=self.softcap)
         self.selector.prepare(s.hidden.view(-1, s.block_size, s.hidden.shape[-1]))
 
     def scratch_tensors(self):
