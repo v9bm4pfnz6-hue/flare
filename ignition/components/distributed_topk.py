@@ -39,8 +39,20 @@ def _pack_candidates(Indices, Scores, Packed, Rank, row_stride,
 
 
 def _pack_local_candidates(indices, scores, local, rank, world):
-    """Write this rank's candidate score/global-position pairs for the all-gather."""
+    """Write this rank's candidate score/global-position pairs for the all-gather.
+
+    The kernel addresses candidates and packed slots with row strides only and assumes unit
+    inner strides, matching contiguous caller-owned slices; validate that instead of letting a
+    mismatched layout write out of place.
+    """
     rows, topk = indices.shape
+    if (indices.dtype != torch.int32 or scores.dtype != torch.float32
+            or scores.shape != indices.shape
+            or indices.stride(0) != scores.stride(0)
+            or indices.stride(1) != 1 or scores.stride(1) != 1
+            or local.dtype != torch.float32 or local.shape != (rows, topk, 2)
+            or local.stride() != (2 * topk, 2, 1)):
+        raise ValueError("candidate packing requires matching contiguous int32/FP32 candidate rows")
     _launch(_pack_candidates, (rows, triton.cdiv(topk, 1024)),
             (indices, scores, local.view(torch.int32), rank, indices.stride(0)),
             TOPK=topk, WORLD=world, BLOCK=1024, num_warps=4)

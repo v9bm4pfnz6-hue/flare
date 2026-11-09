@@ -386,6 +386,15 @@ class PreparedDecoder:
             if "auxiliary" not in self.buffers:
                 self.buffers["auxiliary"] = zeros((auxiliary_rows, len(self.auxiliary_layers) * hidden))
             self.auxiliary = self.buffers["auxiliary"][:auxiliary_rows]
+        # One request-metadata derivation per replay, shared by every DSA layer.
+        self.selection = None
+        if mode != "prefill" and "dsa" in config.layers:
+            from .dcp import ContextShards
+            from .selection import PreparedSelectionMetadata
+
+            shards = context.shards if context is not None else ContextShards()
+            self.selection = PreparedSelectionMetadata(metadata, shards, rows=source.shape[0],
+                device=source.device, buffers=self.buffers.setdefault("dsa_selection", {}), allocator=allocator)
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
             kind = config.layers[index]
@@ -400,6 +409,7 @@ class PreparedDecoder:
                             peers=context.peers.get(index) if context is not None else None,
                             index_peers=(context.index_peers.get(index)
                                          if context is not None and context.index_peers is not None else None),
+                            selection=self.selection,
                             coordinator=coordinator,
                             # The smallest latent exchange that carries the step, else the largest in chunks.
                             latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
@@ -480,6 +490,8 @@ class PreparedDecoder:
         # a block commits its running sum when the next block starts.
         size, eps = c["attn_res_block_size"], c["rms_norm_eps"]
         delta, mode = self.embedding.gather(local), REPLACE
+        if self.selection is not None:
+            self.selection()
         for index, (w, attention, mlp, reduce) in enumerate(self.layers):
             committed, boundary = -(-index // size), index % size == 0
             mixture = None

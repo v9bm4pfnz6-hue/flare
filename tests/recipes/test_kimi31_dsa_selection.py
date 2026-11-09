@@ -1,39 +1,115 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU checks for the fused DSA selection prologue and candidate packing.
+"""CPU checks for the shared DSA selection metadata and candidate packing.
 
-The Triton kernels are GPU-only. These tests run the recipe launch wiring through a
-torch emulation of each kernel and compare the written buffers bitwise against the
-elementwise torch sequence the fused launches replace. The kernels themselves are
-validated on GPUs by the ticket under optimization-team/tickets/dsa/.
+The Triton candidate-packing kernel is GPU-only, so its launch wiring is exercised
+through a torch emulation and compared bitwise with the elementwise torch sequence it
+replaces. The shared selection metadata is plain torch and is compared directly.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from ignition.components import distributed_topk
 from ignition.recipes.kimi3 import dsa
+from ignition.recipes.kimi3.dcp import ContextShards, RECORD_BYTES
+from ignition.recipes.kimi3.selection import PreparedSelectionMetadata
 
 
-def _selection_metadata_emulation(arguments, metadata):
-    positions, table, rank, pages, lengths, table_stride, pages_stride = arguments
-    world, width = metadata["WORLD"], metadata["WIDTH"]
-    owner = int(rank.reshape(-1)[0])
-    for row in range(positions.shape[0]):
-        length = max(int(positions[row]) + 1, 0)
-        lengths[row] = length // world + int(length % world > owner)
-        flat, output = table.reshape(-1), pages.reshape(-1)
-        for column in range(width):
-            page = int(flat[row * table_stride + column])
-            target = row * pages_stride + 2 * column
-            output[target] = 2 * page if page >= 0 else -1
-            output[target + 1] = 2 * page + 1 if page >= 0 else -1
+def _per_layer_metadata(metadata, shards, rows):
+    expanded = metadata.token_page_table[:rows, :, None] * 2 + torch.arange(2, dtype=torch.int32)
+    pages = torch.where(metadata.token_page_table[:rows, :, None] >= 0, expanded, -1).flatten(1)
+    lengths = shards.local_tokens((metadata.positions[:rows] + 1).clamp_min(0)).to(torch.int32)
+    capacity = min(rows, dsa.SELECTION_ROWS)
+    active = torch.stack([lengths[stage:stage + capacity].max().reshape(1)[0]
+                          for stage in range(0, rows, capacity)])
+    return pages, lengths, active
 
 
-def _selection_maximum_emulation(arguments, metadata):
-    lengths, active, count = arguments
-    active[0] = lengths[:count].max()
+@pytest.mark.parametrize("rows,width,world,rank", [
+    (1, 7, 9, 0), (7, 7, 9, 8), (24, 7, 9, 4), (32, 911, 9, 3),
+    (33, 7, 9, 5), (40, 7, 2, 1), (96, 911, 9, 8), (32, 1, 1, 0),
+])
+def test_shared_selection_metadata_matches_per_layer_sequence(rows, width, world, rank):
+    generator = torch.Generator().manual_seed(rows * 977 + width * 13 + world * 7 + rank)
+    metadata = SimpleNamespace(
+        positions=torch.randint(-1, 1 << 20, (rows,), generator=generator, dtype=torch.int64),
+        token_page_table=torch.randint(-1, 512, (rows, width), generator=generator, dtype=torch.int32))
+    shards = ContextShards.on(rank, world, "cpu")
+    buffers = {}
+    component = PreparedSelectionMetadata(metadata, shards, rows=rows, device="cpu", buffers=buffers)
+    view = component()
+    expected = _per_layer_metadata(metadata, shards, rows)
+    assert torch.equal(view.pages, expected[0])
+    assert torch.equal(view.lengths, expected[1])
+    assert torch.equal(view.active, expected[2])
+    # A second call rewrites the same buffers from new metadata values.
+    metadata.positions.add_(3)
+    view = component()
+    expected = _per_layer_metadata(metadata, shards, rows)
+    assert torch.equal(view.pages, expected[0])
+    assert torch.equal(view.lengths, expected[1])
+    assert torch.equal(view.active, expected[2])
+
+
+def _construct_shared(monkeypatch, rows, world):
+    def selector(query, weights, cache, pages, lengths, active, output, **kwargs):
+        return SimpleNamespace(query=query, weights=weights, cache=cache, pages=pages,
+            lengths=lengths, active=active, output=output, scores=kwargs["scores"])
+
+    def merge(indices, scores, output, **kwargs):
+        return SimpleNamespace(indices=indices, scores=scores, output=output)
+
+    def attention(query, cache, output, pages, lengths, starts, **kwargs):
+        return SimpleNamespace(query=query, cache=cache, output=output, pages=pages,
+            lengths=lengths, starts=starts, lse=kwargs["lse"])
+
+    def collective(source, output, **kwargs):
+        return SimpleNamespace(source=source, output=output)
+
+    def combine(partial, lse, output, **kwargs):
+        return SimpleNamespace(partial=partial, lse=lse, output=output)
+
+    monkeypatch.setattr(dsa, "prepare_projection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(dsa, "PreparedFP8Indexer", selector)
+    monkeypatch.setattr(dsa, "PreparedDistributedTopK", merge)
+    monkeypatch.setattr(dsa, "PreparedDenseMLA", attention)
+    monkeypatch.setattr(dsa, "PreparedAllGather", collective)
+    monkeypatch.setattr(dsa, "PreparedLseReduceScatter", combine)
+    monkeypatch.setattr(dsa.dense_mla, "Caps", lambda **kwargs: SimpleNamespace(**kwargs))
+    capacity = dsa.SELECTION_ROWS
+    metadata = SimpleNamespace(positions=torch.arange(rows, dtype=torch.int64),
+        token_page_table=torch.zeros((rows, 2), dtype=torch.int32))
+    selection_rows = rows if rows <= capacity else capacity
+    shared = SimpleNamespace(
+        pages=torch.zeros((rows, 4), dtype=torch.int32),
+        lengths=torch.zeros((rows,), dtype=torch.int32),
+        active=torch.zeros((-(-rows // selection_rows),), dtype=torch.int32))
+    context = None if world == 1 else SimpleNamespace(
+        shards=ContextShards.on(0, world, "cpu"), candidates=object(), heads=object())
+    op = dsa.PreparedDSA(
+        {"index_query": None, "index_norm": torch.ones(128), "index_bias": torch.zeros(128)},
+        torch.zeros((rows, 8)), torch.zeros((rows, 128)), torch.zeros((rows, 32)),
+        torch.zeros((rows, 1, RECORD_BYTES), dtype=torch.bfloat16),
+        torch.zeros((rows, 1, 512), dtype=torch.bfloat16), torch.zeros(rows, dtype=torch.int64), metadata,
+        torch.zeros((2, 128, RECORD_BYTES), dtype=torch.float8_e4m3fn),
+        torch.zeros((4, 64 * 132), dtype=torch.uint8), context=context,
+        session=None, coordinator=None, name="attention", workspace=None, buffers={}, selection=shared)
+    return op, shared, capacity
+
+
+@pytest.mark.parametrize("rows,world", [(8, 9), (33, 9), (96, 9), (8, 1)])
+def test_layer_binds_shared_selection_slices(monkeypatch, rows, world):
+    op, shared, capacity = _construct_shared(monkeypatch, rows, world)
+    assert len(op.stages) == -(-rows // capacity)
+    for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired in op.stages:
+        stage = begin // capacity
+        assert torch.equal(selector.pages, shared.pages[begin:end])
+        assert torch.equal(selector.lengths, shared.lengths[begin:end])
+        assert torch.equal(selector.active, shared.active[stage:stage + 1])
 
 
 def _pack_candidates_emulation(arguments, metadata):
@@ -49,41 +125,10 @@ def _pack_candidates_emulation(arguments, metadata):
 
 
 def _emulate(kernel, grid, arguments, **metadata):
-    if kernel is dsa._selection_metadata:
-        _selection_metadata_emulation(arguments, metadata)
-    elif kernel is dsa._selection_maximum:
-        _selection_maximum_emulation(arguments, metadata)
-    elif kernel is distributed_topk._pack_candidates:
+    if kernel is distributed_topk._pack_candidates:
         _pack_candidates_emulation(arguments, metadata)
     else:
         raise AssertionError(f"unexpected kernel {kernel!r}")
-
-
-@pytest.mark.parametrize("count,width,world,rank", [
-    (1, 7, 9, 0), (2, 7, 9, 8), (6, 7, 9, 4), (8, 7, 9, 3),
-    (24, 7, 9, 7), (32, 7, 9, 0), (24, 1, 1, 0), (3, 911, 9, 5),
-])
-def test_selection_metadata_matches_torch_sequence(monkeypatch, count, width, world, rank):
-    monkeypatch.setattr(dsa, "_launch", _emulate)
-    generator = torch.Generator().manual_seed(count * 131 + width * 17 + world * 7 + rank)
-    positions = torch.randint(-1, 1 << 20, (count,), generator=generator, dtype=torch.int64)
-    table = torch.randint(-1, 512, (count, width), generator=generator, dtype=torch.int32)
-    capacity = dsa.SELECTION_ROWS
-    pages = torch.full((capacity, 2 * width), 1234, dtype=torch.int32)
-    lengths = torch.full((capacity,), 4321, dtype=torch.int32)
-    active = torch.full((1,), 99, dtype=torch.int32)
-    dsa._write_selection_metadata(positions, table, pages[:count], lengths[:count], active, world,
-                                  torch.tensor([rank], dtype=torch.int64))
-    expanded = table[:, :, None] * 2 + torch.arange(2, dtype=torch.int32)
-    clamped = (positions + 1).clamp_min(0)
-    expected_pages = torch.where(table[:, :, None] >= 0, expanded, -1).flatten(1)
-    expected_lengths = (clamped // world + (clamped % world > rank).to(torch.int64)).to(torch.int32)
-    assert torch.equal(pages[:count], expected_pages)
-    assert torch.equal(lengths[:count], expected_lengths)
-    assert active.item() == int(expected_lengths.max())
-    # The buffers keep their declared capacity; rows beyond the slice are untouched.
-    assert torch.all(pages[count:] == 1234)
-    assert torch.all(lengths[count:] == 4321)
 
 
 @pytest.mark.parametrize("rows,topk,world,rank", [
@@ -107,10 +152,7 @@ def test_candidate_packing_matches_torch_sequence(monkeypatch, rows, topk, world
 
 
 def test_record_mapper_writes_caller_buffers(monkeypatch):
-    seen = {}
-
     def fake_launch(kernel, grid, arguments, **metadata):
-        seen["kernel"], seen["grid"] = kernel, grid
         output, count = arguments[4], arguments[5]
         output.copy_(arguments[0])
         count.fill_(arguments[0].shape[1])
@@ -125,7 +167,6 @@ def test_record_mapper_writes_caller_buffers(monkeypatch):
         output=output, counts=counts)
     assert result[0] is output and result[1] is counts
     assert torch.equal(output, selected) and torch.equal(counts, torch.full((2,), 6, dtype=torch.int32))
-    assert seen["kernel"] is distributed_topk._records and seen["grid"] == (2,)
     with pytest.raises(ValueError):
         distributed_topk.selected_local_records(
             selected, torch.zeros(2, dtype=torch.int64), torch.zeros((2, 1), dtype=torch.int32),

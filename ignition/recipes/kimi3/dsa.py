@@ -4,8 +4,6 @@
 """Gated Kimi DSA: learned selection over context-sharded FP8 keys and latent records."""
 
 import torch
-import triton
-import triton.language as tl
 from b12x.attention import dense_mla
 
 from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
@@ -18,76 +16,15 @@ from .dcp import ContextShards, RECORD_BYTES, lse_geometry, pull_context
 from .projections import prepare_projection
 
 # Slice selection and its cross-rank candidate exchange so prefill scratch is context-independent.
-# Slice selection and its cross-rank candidate exchange so prefill scratch is context-independent.
 SELECTION_ROWS = 32
 INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
-
-
-def _launch(kernel, grid, arguments, **metadata):
-    from torch.fx.experimental.proxy_tensor import get_proxy_mode
-
-    if torch.compiler.is_compiling() or get_proxy_mode() is not None:
-        torch.library.wrap_triton(kernel)[grid](*arguments, **metadata)
-    else:
-        kernel[grid](*arguments, **metadata)
-
-
-@triton.jit
-def _selection_metadata(Positions, Table, Rank, Pages, Lengths, table_stride, pages_stride,
-                        WORLD: tl.constexpr, STEPS: tl.constexpr, WIDTH: tl.constexpr,
-                        BLOCK: tl.constexpr):
-    # One program per query row: expand the model page table into the two planar FP8 index
-    # pages a model page owns, and derive this shard's visible length of the row's prefix.
-    row = tl.program_id(0)
-    rank = tl.load(Rank)
-    length = tl.maximum(tl.load(Positions + row).to(tl.int64) + 1, 0)
-    local = length // WORLD + (length % WORLD > rank).to(tl.int64)
-    tl.store(Lengths + row, local.to(tl.int32))
-    source = Table + row * table_stride
-    target = Pages + row * pages_stride
-    for step in tl.static_range(STEPS):
-        columns = step * BLOCK + tl.arange(0, BLOCK)
-        mask = columns < WIDTH
-        page = tl.load(source + columns, mask=mask, other=-1)
-        live = page >= 0
-        doubled = 2 * page
-        # An inactive page table entry maps both halves of the row to -1, as the torch form does.
-        tl.store(target + 2 * columns, tl.where(live, doubled, -1), mask=mask)
-        tl.store(target + 2 * columns + 1, tl.where(live, doubled + 1, -1), mask=mask)
-
-
-@triton.jit
-def _selection_maximum(Lengths, Active, count, BLOCK: tl.constexpr):
-    offsets = tl.arange(0, BLOCK)
-    values = tl.load(Lengths + offsets, mask=offsets < count, other=0)
-    tl.store(Active, tl.max(values, 0))
-
-
-def _write_selection_metadata(positions, table, pages, lengths, active, world, rank):
-    """Write the index page table, shard lengths and active width of one selection slice.
-
-    The integer values are identical to the elementwise torch sequence this replaces
-    (where(table >= 0, table * 2 + halves, -1), local_tokens(positions + 1) and
-    lengths.max()); the buffers keep their declared capacities and rows beyond
-    ``count`` are untouched.
-    """
-    count = positions.shape[0]
-    width = pages.shape[1] // 2
-    if count == 0 or width == 0:
-        return
-    if count > SELECTION_ROWS:
-        raise ValueError("selection metadata rows exceed the prepared selection slice")
-    _launch(_selection_metadata, (count,),
-            (positions, table, rank, pages, lengths, table.stride(0), pages.stride(0)),
-            WORLD=world, STEPS=(width + 255) // 256, WIDTH=width, BLOCK=256, num_warps=4)
-    _launch(_selection_maximum, (1,), (lengths, active, count),
-            BLOCK=SELECTION_ROWS, num_warps=1)
 
 
 class PreparedDSA:
     def __init__(self, weights, query_residual, key_input, weight_input, query, output, slots,
                  metadata, cache, index_cache, *, context, session, coordinator, name, workspace,
-                 buffers, allocator=None, eps=1e-5, mode="decode", latent=None, peers=None, index_peers=None):
+                 buffers, allocator=None, eps=1e-5, mode="decode", latent=None, peers=None, index_peers=None,
+                 selection=None):
         self.prefill = None
         if mode == "prefill" and context is not None and context.prefill_layout == "query_split":
             from .dsa_prefill import PreparedGatheredDSA
@@ -113,9 +50,6 @@ class PreparedDSA:
         self.rows = rows
         self.step = min(rows, SELECTION_ROWS)
         device = query.device
-        # Compiled forwards are shared by every rank, so the shard index stays a device tensor.
-        index = self.shards.owner
-        self.rank = index if isinstance(index, torch.Tensor) else torch.zeros((1,), dtype=torch.int64, device=device)
 
         def allocate(key, shape, dtype):
             existing = buffers.get(key)
@@ -137,15 +71,24 @@ class PreparedDSA:
         self.project = prepare_projection(query_residual, weights["index_query"], self.local_index_query.view(rows, -1),
             session=session, name=name + ".index_query", workspace=workspace)
         capacity = self.step
-        self.pages = allocate("index_pages", (capacity, metadata.token_page_table.shape[1] * 2), torch.int32)
-        self.lengths = allocate("index_lengths", (capacity,), torch.int32)
-        self.active = allocate("index_active", (1,), torch.int32)
+        self.selection = selection
+        if selection is None:
+            self.pages = allocate("index_pages", (capacity, metadata.token_page_table.shape[1] * 2), torch.int32)
+            self.lengths = allocate("index_lengths", (capacity,), torch.int32)
+            self.active = allocate("index_active", (1,), torch.int32)
+        else:
+            # The decoder computes one layer-independent selection metadata set per replay.
+            if (selection.pages.shape[0] < rows or selection.lengths.shape[0] < rows
+                    or selection.active.shape[0] < -(-rows // capacity)):
+                raise ValueError("shared DSA selection metadata does not cover the decoder rows")
+            self.pages, self.lengths, self.active = selection.pages, selection.lengths, selection.active
         self.local = allocate("index_local", (capacity, TOPK), torch.int32)
         self.scores = allocate("index_scores", (capacity, TOPK), torch.float32)
         self.selected = allocate("index_selected", (capacity, TOPK), torch.int32)
         self.physical = allocate("index_physical", (capacity, TOPK), torch.int32)
         self.counts = allocate("index_counts", (capacity,), torch.int32)
         self.offsets = torch.arange(capacity + 1, device=device, dtype=torch.int32)
+        self.page_halves = torch.arange(2, device=device, dtype=torch.int32)
         self.stages = []
         # Sequential slices and layers reuse the same selection buffers; each operator owns its binding.
         from ignition.preparation.scratch import GraphBufferPool
@@ -155,20 +98,31 @@ class PreparedDSA:
             buffers["index_workspace"] = GraphBufferPool(device, chunk_bytes=2 << 20)
         pool = buffers["index_workspace"]
         cache_records = (context.slab if self.gathered_context else cache).view(-1, 1, RECORD_BYTES)
-        selection_views = {}
+        selection_views, shared_views = {}, {}
         for begin in range(0, rows, capacity):
             end = min(begin + capacity, rows)
             count = end - begin
             stage_name = name + f".rows{begin}"
             cursor = pool.cursor()
             # Identical stage regions share tensor identities as well as their backing storage.
-            if count not in selection_views:
-                selection_views[count] = (self.pages[:count], self.lengths[:count], self.local[:count],
-                    self.scores[:count], self.selected[:count], self.physical[:count], self.counts[:count],
-                    self.offsets[:count + 1])
-            pages, lengths, local, scores, selected, physical, counts, offsets = selection_views[count]
+            if selection is None:
+                if count not in selection_views:
+                    selection_views[count] = (self.pages[:count], self.lengths[:count], self.local[:count],
+                        self.scores[:count], self.selected[:count], self.physical[:count], self.counts[:count],
+                        self.offsets[:count + 1])
+                pages, lengths, local, scores, selected, physical, counts, offsets = selection_views[count]
+                active = self.active
+            else:
+                if count not in shared_views:
+                    shared_views[count] = (self.local[:count], self.scores[:count], self.selected[:count],
+                        self.physical[:count], self.counts[:count], self.offsets[:count + 1])
+                local, scores, selected, physical, counts, offsets = shared_views[count]
+                # The shared metadata spans the whole graph; each slice reads its own rows.
+                stage = begin // capacity
+                pages, lengths = selection.pages[begin:end], selection.lengths[begin:end]
+                active = selection.active[stage:stage + 1]
             selector = PreparedFP8Indexer(self.index_query[begin:end], weight_input[begin:end], index_cache,
-                pages, lengths, self.active, local, mode="decode",
+                pages, lengths, active, local, mode="decode",
                 session=session, name=stage_name + ".index", workspace=workspace, buffers=cursor,
                 scores=scores, rotation="none")
             merge = None
@@ -223,8 +177,11 @@ class PreparedDSA:
         for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired in self.stages:
             count = end - begin
             positions, pages = m.positions[begin:end], m.token_page_table[begin:end]
-            _write_selection_metadata(positions, pages, self.pages[:count], self.lengths[:count],
-                self.active, shards.world, self.rank)
+            if self.selection is None:
+                expanded = pages[:, :, None] * 2 + self.page_halves
+                self.pages[:count].copy_(torch.where(pages[:, :, None] >= 0, expanded, -1).flatten(1))
+                self.lengths[:count].copy_(shards.local_tokens((positions + 1).clamp_min(0)).to(torch.int32))
+                self.active.copy_(self.lengths[:count].max().reshape(1))
             if paired is not None:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
                 paired(quantized.view(count, -1), self.local_index_query[begin:end].view(count, -1))
