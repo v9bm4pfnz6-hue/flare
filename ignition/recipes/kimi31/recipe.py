@@ -42,8 +42,13 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
     # Gather threads are tuned independently; the attention components declare LSE's 512-thread geometry.
     # The TP9 gather reaches peak at the kernel's 64-block ceiling: measured 28.87 ms against 31.96 ms
     # at the inherited eight-block limit for 4608 rows, and 6.41 ms against 7.06 ms at 1024 rows.
+    # The block limit is a wide-grid override for those large gathers and only applies to prepared
+    # shapes at or above B12X_PCIE_DCP_BLOCK_LIMIT_MIN_ROWS rows; below the threshold the DCP
+    # collective tuner races block counts, so 1-8-row decode gathers are not forced onto 64 CTAs.
+    # Setting MIN_ROWS to 0 restores the historical static pin for every shape.
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0",
-                                       "B12X_PCIE_DCP_BLOCK_LIMIT": "64"}),
+                                       "B12X_PCIE_DCP_BLOCK_LIMIT": "64",
+                                       "B12X_PCIE_DCP_BLOCK_LIMIT_MIN_ROWS": "512"}),
     ranks=MappingProxyType({8: RankCosts(state_row_bytes=63_181_056, page_bytes=2_543_616,
                                        graph_bytes=9 << 29, page_tokens=128 * 8),
                            9: RankCosts(state_row_bytes=58_129_152, page_bytes=2_543_616,
