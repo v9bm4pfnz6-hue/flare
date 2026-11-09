@@ -171,17 +171,18 @@ class PreparedRouteGather:
         _OWNERS[self.handle] = self
 
     def compact(self):
-        for rank in range(self.world):
-            down_begin = rank * self.down_width
-            down_count = min(self.down_width, self.latent.shape[1] - down_begin)
-            if down_count > 0:
-                self.latent[:, down_begin:down_begin + down_count].copy_(
-                    self.gathered_latent[:, down_begin:down_begin + down_count])
-            router_begin = rank * self.router_width
-            router_count = min(self.router_width, self.logits.shape[1] - router_begin)
-            if router_count > 0:
-                self.logits[:, router_begin:router_begin + router_count].copy_(
-                    self.gathered_logits[:, router_begin:router_begin + router_count])
+        """Copy each rank's gathered shard into its logical column range.
+
+        The exchange writes rank-major padded rows: source rank r occupies
+        padded columns [r * down_width, (r + 1) * down_width), and the last
+        rank's block is clipped at the logical width. The caller-owned rows
+        use the same rank-major geometry up to their logical width, so
+        copying the logical prefix of each gathered row reproduces every
+        per-rank copy with one strided copy per tensor. No value, value
+        order, destination or dtype changes.
+        """
+        self.latent.copy_(self.gathered_latent[:, :self.latent.shape[1]])
+        self.logits.copy_(self.gathered_logits[:, :self.logits.shape[1]])
 
     def __call__(self):
         _route_gather(self.local_down, self.local_router, self.latent, self.weights, self.ids, self.handle)
