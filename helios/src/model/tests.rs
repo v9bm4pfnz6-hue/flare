@@ -57,6 +57,64 @@ pub(super) fn config() -> ModelConfig {
 }
 
 #[test]
+fn context_limit_stays_distinct_from_page_addressable_capacity() {
+    for (declared, page_tokens, pages, draft_pages, limit, prepared) in [
+        (1_048_576, 1_152, 911, 0, 1_048_576, 1_049_472),
+        (1_048_576, 1_152, 911, 1, 1_048_320, 1_048_320),
+        (4_000, 64, 64, 0, 4_000, 4_032),
+        (4_096, 64, 64, 1, 4_032, 4_032),
+        (1_000, 128, 8, 0, 1_000, 1_024),
+        (2_048, 256, 8, 0, 2_048, 2_048),
+        (2_048, 0, 64, 0, 0, 0),
+        (2_048, 64, 0, 0, 0, 0),
+    ] {
+        let mut config = config();
+        config.contract.cache.page_tokens = page_tokens;
+        config.contract.cache.page_tables[0].page_offset = draft_pages;
+        config.speculative_widths = if draft_pages == 0 { vec![] } else { vec![1, 8] };
+        config.limits.max_sequence_tokens = declared;
+        config.limits.pages = pages;
+        config.prepared_sequence_tokens = if page_tokens == 0 {
+            0
+        } else {
+            declared.checked_next_multiple_of(page_tokens).unwrap_or(usize::MAX)
+        };
+        config.fit_context();
+        assert_eq!(
+            (config.limits.max_sequence_tokens, config.prepared_sequence_tokens),
+            (limit, prepared),
+            "page_tokens={page_tokens} pages={pages} draft_pages={draft_pages}"
+        );
+        if limit > 0 && draft_pages == 0 {
+            let mut manifest = manifest(&config);
+            manifest.graphs.retain(|graph| {
+                graph.kind != GraphKind::Speculative
+                    && (graph.kind != GraphKind::Prefill || graph.batch_capacity == 1)
+            });
+            for (index, graph) in manifest.graphs.iter_mut().enumerate() {
+                graph.handle = index + 1;
+            }
+            catalog::validate(&config, &manifest).unwrap();
+            Inputs::new(&config, &manifest).unwrap();
+            let page_table = manifest
+                .buffers
+                .iter()
+                .find(|buffer| buffer.name == "page_tables")
+                .unwrap();
+            assert_eq!(page_table.shape, [4, prepared / page_tokens]);
+        }
+    }
+
+    let mut config = config();
+    config.contract.cache.page_tokens = usize::MAX - 1;
+    config.limits.max_sequence_tokens = usize::MAX;
+    config.limits.pages = 2;
+    config.fit_context();
+    assert_eq!(config.limits.max_sequence_tokens, usize::MAX);
+    assert_eq!(config.prepared_sequence_tokens, usize::MAX);
+}
+
+#[test]
 fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics() {
     let config = config();
     let mut scheduler = RequestScheduler::new(

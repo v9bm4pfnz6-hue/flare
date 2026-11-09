@@ -116,7 +116,7 @@ impl Bootstrap {
                     ))
                 })?;
         }
-        let contract = serde_json::from_value(
+        let contract: crate::model::PreparedContract = serde_json::from_value(
             object
                 .get("model_contract")
                 .ok_or("model_contract metadata is required")?
@@ -128,8 +128,17 @@ impl Bootstrap {
                 error,
             ))
         })?;
-        let prepared_sequence_tokens = usize::try_from(integer("max_sequence_tokens", None)?)
+        let max_sequence_tokens = usize::try_from(integer("max_sequence_tokens", None)?)
             .map_err(|_| "prepared context extent overflow")?;
+        let page_tokens = usize::try_from(integer("page_tokens", Some(contract.cache.page_tokens as u64))?)
+            .map_err(|_| "prepared page extent overflow")?;
+        let prepared_sequence_tokens = if page_tokens == 0 {
+            0
+        } else {
+            max_sequence_tokens
+                .checked_next_multiple_of(page_tokens)
+                .ok_or("prepared context extent overflow")?
+        };
         let mut model = ModelConfig {
             completion_token_capacity: manifest.completion_token_capacity,
             max_top_logprobs: manifest.max_top_logprobs()?,
@@ -145,7 +154,7 @@ impl Bootstrap {
                     Some(manifest.max_active as u64),
                 )?)
                 .map_err(|_| "runtime concurrency exceeds usize")?,
-                max_sequence_tokens: prepared_sequence_tokens,
+                max_sequence_tokens,
                 prefill_chunk_size: usize::try_from(integer("prefill_chunk_size", Some(4096))?)
                     .map_err(|error| {
                         crate::ExecutionError::Manifest(crate::Failure::caused_by(

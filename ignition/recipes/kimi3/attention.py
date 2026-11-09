@@ -20,7 +20,7 @@ from ignition.components.collectives import PreparedAllGather, PreparedChunkedAl
 from ignition.components.dense_mla import PreparedDenseMLA
 
 from .config import PAGE_TOKENS
-from .dcp import RECORD_BYTES, ContextShards, pull_context, write_records
+from .dcp import RECORD_BYTES, ContextShards, lse_geometry, pull_context, write_records
 from .pointwise import rms_norm_columns, sigmoid_gate
 from .projections import prepare_projection
 
@@ -55,24 +55,33 @@ class PreparedMLA:
         self.weights, self.metadata, self.mode, self.cache = weights, metadata, mode, cache
         self.eps, self.rotary, self.gated = eps, rotary, gated
         # Each rank projects only its query and KV latent rows beside its output gate, and the ranks gather the
-        # latents, as vLLM's VLLM_KIMI_SHARD_QKV_A does: every rank keeps and reads a sixteenth of the latent
-        # projection. A single rank (``latents`` None) projects every latent row itself.
+        # latents, as vLLM's VLLM_KIMI_SHARD_QKV_A does: every rank keeps and reads one latent-projection shard.
+        # A single rank (``latents`` None) projects every latent row itself.
         self.latent_gather = None
         local_width = (weights["latent_gate"].shape[0] if isinstance(weights["latent_gate"], torch.Tensor)
                        else weights["latent_gate"].out_features)
+        query_width = latent_width - RECORD_BYTES
         if latents is None:
+            self.local_q, self.local_kv = query_width, RECORD_BYTES
             self.local = buffer("local", local_width)
             self.input = self.local[:, :latent_width]
+            self.query_input = self.input[:, :query_width]
+            self.kv_input = self.input[:, query_width:]
             self.gate = self.local[:, latent_width:latent_width + heads * 128]
         else:
             rows, width = latents.max_batch_size, latents.query_head_dim
-            self.input = buffer("input", latent_width)
+            world = latents.world_size
+            self.local_q = -(-query_width // world)
+            self.local_kv = -(-RECORD_BYTES // world)
+            self.input = buffer("input", world * (self.local_q + self.local_kv))
+            self.query_input = self.input[:, :world * self.local_q]
+            self.kv_input = self.input[:, world * self.local_q:]
             self.local = buffer("local", local_width, rows=rows)
             self.gate = self.local[:, width:width + heads * 128]
             # The exchange reads contiguous rows, which a single row's latent columns already are.
             self.staged = tokens > 1
             self.send = buffer("send", width, rows=rows) if self.staged else self.local[:, :width]
-            self.gathered_latents = buffer("gathered_latents", latents.world_size * width, rows=rows)
+            self.gathered_latents = buffer("gathered_latents", world * width, rows=rows)
             self.latent_gather = PreparedChunkedAllGather(self.send, self.gathered_latents, runtime=latents,
                 session=session, coordinator=coordinator, name=name + ".gather_latents")
         self.projections = {key: prepare_projection(x, weights[key], y, session=session,
@@ -134,8 +143,10 @@ class PreparedMLA:
             self.attention = PreparedDenseMLA(self.gathered, cache, self.partial, self.token_pages,
                 self.token_lengths, self.token_starts, caps=caps, scale=scale, session=session,
                 name=name + ".attention", workspace=workspace, lse=self.lse)
+            threads, block_limit = lse_geometry(tokens, self.shards.world)
             self.combine = PreparedLseReduceScatter(self.partial, self.lse, self.attended, runtime=context.heads,
-                session=session, coordinator=context.coordinator, name=name + ".combine", threads=512, block_limit=8)
+                session=session, coordinator=context.coordinator, name=name + ".combine",
+                threads=threads, block_limit=block_limit)
 
     def __call__(self, source):
         p, m, shards = self.projections, self.metadata, self.shards
@@ -148,13 +159,12 @@ class PreparedMLA:
             # Rank-major latent shards back into the query and KV latents they partition.
             world = self.gathered_latents.shape[1] // width
             gathered = self.gathered_latents.view(tokens, world, width)
-            query = self.input.shape[1] - RECORD_BYTES
-            q, kv = query // world, RECORD_BYTES // world
-            self.input[:, :query].view(tokens, world, q).copy_(gathered[:, :, :q])
-            self.input[:, query:].view(tokens, world, kv).copy_(gathered[:, :, q:q + kv])
-        rms_norm_columns(self.input[:, :-RECORD_BYTES], self.weights["query_norm"], self.query_norm, self.eps)
-        rms_norm_columns(self.input[:, -RECORD_BYTES:-64], self.weights["kv_norm"], self.latent[:, :512], self.eps)
-        self.latent[:, 512:].copy_(self.input[:, -64:])
+            q, kv = self.local_q, self.local_kv
+            self.query_input.view(tokens, world, q).copy_(gathered[:, :, :q])
+            self.kv_input.view(tokens, world, kv).copy_(gathered[:, :, q:q + kv])
+        rms_norm_columns(self.query_input[:, :self.query_norm.shape[1]], self.weights["query_norm"], self.query_norm, self.eps)
+        rms_norm_columns(self.kv_input[:, :512], self.weights["kv_norm"], self.latent[:, :512], self.eps)
+        self.latent[:, 512:].copy_(self.kv_input[:, 512:])
         p["q_b"](self.query_norm)
         if self.rotary is not None:
             self.rotary.apply(self.query, m.positions)

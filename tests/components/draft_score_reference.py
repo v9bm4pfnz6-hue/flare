@@ -11,7 +11,7 @@ import triton.language as tl
 def draft_scores_reference(Logits, Histogram, Candidates, Slots, Params, GrammarMask, GrammarEnabled,
                            Scores, BlockMax, hist_stride, mask_stride, candidate_stride,
                            CAPACITY: tl.constexpr, V: tl.constexpr, PREFIX: tl.constexpr,
-                           BLOCK: tl.constexpr, BLOCKS: tl.constexpr):
+                           BLOCK: tl.constexpr, BLOCKS: tl.constexpr, DRAFT_TEMPERATURE: tl.constexpr):
     row, block = tl.program_id(0), tl.program_id(1)
     safe = tl.minimum(tl.maximum(tl.load(Slots + row).to(tl.int64), 0), CAPACITY - 1)
     token = block * BLOCK + tl.arange(0, BLOCK)
@@ -28,7 +28,7 @@ def draft_scores_reference(Logits, Histogram, Candidates, Slots, Params, Grammar
     adjusted = tl.where(score > 0, tl.math.div_rn(score, repetition), score * repetition)
     score = tl.where(count > 0, adjusted, score)
     score = score - (count > 0).to(tl.float32) * presence - count.to(tl.float32) * frequency
-    score = tl.math.div_rn(score, tl.where(temperature > 0, temperature, 1.))
+    score = tl.math.div_rn(score, tl.where(temperature > 0, temperature * DRAFT_TEMPERATURE, 1.))
     word = tl.load(GrammarMask + safe * mask_stride + token // 32, mask=inside, other=0)
     allowed = (((word >> (token % 32)) & 1) != 0) | (tl.load(GrammarEnabled + safe) == 0)
     score = tl.where(allowed, score, -float("inf"))

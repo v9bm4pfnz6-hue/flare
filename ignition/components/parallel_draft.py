@@ -223,6 +223,8 @@ class PreparedParallelDraftRound:
             and self.selector is None and self.markov is not None
             and ((isinstance(head, torch.Tensor) and head.dtype == torch.bfloat16 and head.is_contiguous())
                  or isinstance(head, RowScaledFP8MarkovWeight)))
+        if fuse_markov and getattr(o, "draft_temperature", 1.) != 1.:
+            raise ValueError("draft temperature requires bounded proposal sampling")
         proposals = tuple(
             PreparedDraftDistribution(
                 self.logits,
@@ -233,6 +235,7 @@ class PreparedParallelDraftRound:
                 offset=self.offset,
                 sampled=self.sampled,
                 workspace=self.sampling_scratch.get("proposal"),
+                draft_temperature=getattr(o, "draft_temperature", 1.),
             )
             for i in range(w - 1 if self.generate_proposals and not fuse_markov else 0)
         )

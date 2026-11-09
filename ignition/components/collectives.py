@@ -201,22 +201,30 @@ class PreparedChunkedAllGather:
 
     def __init__(self, source, output, *, runtime, session, coordinator, name):
         rows = source.shape[0]
+        world = 1 if runtime is None else runtime.world_size
+        gathered = output
+        if source.shape[1] * world > output.shape[1]:
+            gathered = torch.empty((rows, source.shape[1] * world), dtype=output.dtype, device=output.device)
         step = rows if runtime is None or _roce(runtime) else max(1, min(rows, runtime.max_batch_size))
         self.bounds = [(start, min(start + step, rows)) for start in range(0, rows, step)]
-        self.parts = [PreparedAllGather(source[begin:end], output[begin:end], runtime=runtime, session=session,
+        self.parts = [PreparedAllGather(source[begin:end], gathered[begin:end], runtime=runtime, session=session,
                                         coordinator=coordinator, name=name if len(self.bounds) == 1 else f"{name}.{index}")
                       for index, (begin, end) in enumerate(self.bounds)]
-        self.output = output
+        self.output, self.gathered = output, gathered
 
     def __call__(self, source):
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
             part(source[begin:end])
+        if self.gathered is not self.output:
+            self.output.copy_(self.gathered[:, :self.output.shape[1]])
         return self.output
 
     def run_eager(self, source):
         """Gather on the current stream from inside another eager operation."""
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
             part.run_eager(source[begin:end])
+        if self.gathered is not self.output:
+            self.output.copy_(self.gathered[:, :self.output.shape[1]])
         return self.output
 
 

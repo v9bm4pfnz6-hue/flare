@@ -35,6 +35,7 @@ pub struct OutputEnvelope {
     pub tool_ends_reasoning: bool,
     pub tool_body_start: bool,
     pub response: Option<(&'static str, &'static str)>,
+    pub message_end: Option<&'static str>,
 }
 
 struct CheckpointTokenizer {
@@ -279,25 +280,30 @@ impl GrammarCompiler {
         } else {
             "wrapped_answer"
         };
+        let message_end = envelope
+            .message_end
+            .map_or_else(String::new, |end| format!(" {}", self.compound_marker(end)));
         if envelope.tool_body_start {
             if envelope.tool.is_none() {
                 return Err("tool-body output start requires tool syntax".into());
             }
-            rules.push_str("start: tool_after_open tools_suffix ws\n");
+            rules.push_str(&format!(
+                "start: tool_after_open tools_suffix ws{message_end}\n"
+            ));
         } else if let Some(end) = envelope.reasoning_end {
             if let Some((open, _)) = envelope.tool.filter(|_| envelope.tool_ends_reasoning) {
                 rules.push_str(&self.delimited_region("reasoning_done", end, &[end, open]));
                 rules.push_str(&self.delimited_region("reasoning_tool", open, &[end, open]));
                 // Only the outer tool opener implicitly ends reasoning.
                 rules.push_str(&format!(
-                    "start: (reasoning_done ws {branches} | reasoning_tool tool_after_open tools_suffix) ws\n",
+                    "start: (reasoning_done ws {branches} | reasoning_tool tool_after_open tools_suffix) ws{message_end}\n",
                 ));
             } else {
                 rules.push_str(&self.region("reasoning", end));
-                rules.push_str(&format!("start: reasoning ws {branches} ws\n"));
+                rules.push_str(&format!("start: reasoning ws {branches} ws{message_end}\n"));
             }
         } else {
-            rules.push_str(&format!("start: ws {branches} ws\n"));
+            rules.push_str(&format!("start: ws {branches} ws{message_end}\n"));
         }
         grammar.grammars[0].name = Some("answer".into());
         grammar
@@ -974,6 +980,7 @@ mod tests {
                 tool_ends_reasoning: false,
                 response: None,
                 tool_body_start: false,
+                message_end: None,
             };
             for (text, expected) in [
                 (r#"{"ok":true}"#, true),
@@ -1020,15 +1027,20 @@ mod tests {
                 tool_ends_reasoning: false,
                 response: Some(("", "<|close|>response<|sep|>")),
                 tool_body_start: false,
+                message_end: Some("<|close|>message<|sep|>"),
             };
             for (body, expected) in [
-                (r#"{"ok":true}<|close|>response<|sep|>"#, true),
-                (r#"{"ok":false}<|close|>response<|sep|>"#, false),
+                (r#"{"ok":true}<|close|>response<|sep|><|close|>message<|sep|>"#, true),
+                (r#"{"ok":true}<|close|>response<|sep|>"#, false),
+                (r#"{"ok":true}<|close|>response<|sep|>  "#, false),
+                (r#"{"ok":true}<|close|>response<|sep|>  <|close|>message<|sep|>"#, true),
+                (r#"{"ok":false}<|close|>response<|sep|><|close|>message<|sep|>"#, false),
                 (
-                    "<|close|>response<|sep|><|open|>tools<|sep|>call<|close|>tools<|sep|>",
+                    "<|close|>response<|sep|><|open|>tools<|sep|>call<|close|>tools<|sep|><|close|>message<|sep|>",
                     true,
                 ),
-                ("<|open|>tools<|sep|>call<|close|>tools<|sep|>", false),
+                ("<|close|>response<|sep|><|open|>tools<|sep|>call<|close|>tools<|sep|>", false),
+                ("<|open|>tools<|sep|>call<|close|>tools<|sep|><|close|>message<|sep|>", false),
                 (r#"{"ok":true}"#, false),
             ] {
                 let text = if reasoning {
@@ -1060,6 +1072,7 @@ mod tests {
             tool_ends_reasoning: true,
             response: None,
             tool_body_start: false,
+            message_end: None,
         };
         for (text, accepted) in [
             ("thought</think>{\"ok\":true}", true),
@@ -1119,6 +1132,7 @@ mod tests {
                 tool_ends_reasoning,
                 response: None,
                 tool_body_start: false,
+                message_end: None,
             };
             for (text, accepted) in [
                 ("Spell </think> and <think> here.\x02{\"ok\":true}", true),
@@ -1163,6 +1177,7 @@ mod tests {
             tool_ends_reasoning: true,
             response: None,
             tool_body_start: false,
+            message_end: None,
         };
         let schema = json!({"const":7});
         let text = "thought<tool_call><function=f></function></tool_call>7";
@@ -1226,6 +1241,7 @@ mod tests {
                 tool_ends_reasoning: true,
                 response: None,
                 tool_body_start: false,
+                message_end: None,
             };
             let prefix = |pieces: &dyn Fn(&str) -> Vec<u32>| -> Vec<u32> {
                 if reasoning {
@@ -1704,6 +1720,7 @@ mod tests {
                 tool_ends_reasoning: false,
                 tool_body_start: true,
                 response: None,
+                message_end: None,
             };
             let body = format!(
                 "\n<｜DSML｜{separator}invoke name=\"lookup\"></｜DSML｜{separator}invoke>{close}"
@@ -1752,7 +1769,7 @@ mod recipient_tests {
         let compiler=GrammarCompiler::new(&tokenizer,tokenizer.get_vocab_size(true),&[200001,200008],&controls).unwrap();
         let envelope=|start,tools:Vec<String>| OutputEnvelope {
             recipient:Some(RecipientEnvelope{start,tools}),reasoning_end:None,tool:None,function:None,
-            tool_ends_reasoning:false,tool_body_start:false,response:None,
+            tool_ends_reasoning:false,tool_body_start:false,response:None,message_end:None,
         };
         let answer=r#"{"ok":true}"#;
         let tool=" to=lookup<|message|><atem:function_calls><atem:invoke name=\"lookup\"><atem:parameter name=\"q\">café</atem:parameter></atem:invoke></atem:function_calls>";

@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import sys
 import weakref
 from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
-
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.model import PreparedModel
 
@@ -148,6 +149,48 @@ def test_native_start_excludes_close_until_owner_handoff_finishes(monkeypatch):
     assert events == ["synchronize", "synchronize", "graph", "session", "table"]
     model.close()
     assert events.count("graph") == 1
+
+
+def test_native_start_materializes_and_hashes_frontend_assets(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    monkeypatch.setattr(
+        "ignition.preparation.execution.validate_completion_buffers",
+        lambda buffers, capacity: 32,
+    )
+    model, _, _ = model_fixture(monkeypatch)
+    template = tmp_path / "chat_template.jinja"
+    template.write_bytes(b"{{ messages }}")
+    model.server_config["assets"] = {
+        "tokenizer": {"text": "tokenizer bytes"},
+        "chat_template": {"path": str(template)},
+    }
+    observed = {}
+
+    class Runtime:
+        drained = True
+
+        def close(self):
+            pass
+
+    def server(owner, manifest, configuration, **kwargs):
+        assets = json.loads(configuration)["assets"]
+        for name, asset in assets.items():
+            observed[name] = (
+                Path(asset["path"]).read_bytes(),
+                asset["sha256"],
+                asset["path"],
+            )
+        return Runtime()
+
+    monkeypatch.setattr(sys.modules["flare_heliopause"], "Server", server)
+    model.start_server()
+    for name, expected in (("tokenizer", b"tokenizer bytes"), ("chat_template", b"{{ messages }}")):
+        contents, digest, _ = observed[name]
+        assert contents == expected
+        assert digest == hashlib.sha256(expected).hexdigest()
+    assert not Path(observed["tokenizer"][2]).exists()
+    model.close()
 
 
 def test_wrong_thread_close_preserves_runtime_and_all_owners(monkeypatch):

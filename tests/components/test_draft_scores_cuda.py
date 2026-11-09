@@ -37,7 +37,8 @@ def _state(generator):
 @pytest.mark.parametrize("prefix", [0, 1, 3])
 @pytest.mark.parametrize("live", [4, 3])
 @pytest.mark.parametrize("layout", ["duplicate", "stopped"])
-def test_fused_draft_scores_match_reference(prefix, live, layout):
+@pytest.mark.parametrize("draft_temperature", [1., .7])
+def test_fused_draft_scores_match_reference(prefix, live, layout, draft_temperature):
     from ignition.components.draft_sampling import PreparedDraftDistribution
     from ignition.components.speculation import PreparedSpeculativeDistributions
 
@@ -54,12 +55,16 @@ def test_fused_draft_scores_match_reference(prefix, live, layout):
     candidates[1, 0] = -1
     reference = PreparedSpeculativeDistributions(logits, state, slots, generations, live_rows, candidates,
                                                  prefix_offset=prefix)
+    request_temperature = state.parameters[:, 0].clone()
+    state.parameters[:, 0].mul_(draft_temperature)
     reference.prepare_scores()
+    state.parameters[:, 0].copy_(request_temperature)
     seed, offset = torch.zeros(batch, dtype=torch.int64, device="cuda"), torch.zeros(batch, dtype=torch.int64,
                                                                                        device="cuda")
     sampled = torch.zeros(batch, dtype=torch.int64, device="cuda")
     fused = PreparedDraftDistribution(logits, state, slots, generations, live_rows, candidates,
-                                      seed=seed, offset=offset, sampled=sampled, prefix_offset=prefix)
+                                      seed=seed, offset=offset, sampled=sampled, prefix_offset=prefix,
+                                      draft_temperature=draft_temperature)
     fused.prepare()
     fused.prepare_scores()
     torch.cuda.synchronize()
@@ -86,8 +91,10 @@ def _exact(actual, expected):
     (32, 248320, torch.bfloat16, False),
 ])
 @pytest.mark.parametrize("prefix", [0, 3, 7])
+@pytest.mark.parametrize("draft_temperature", [1., .7])
 @torch.no_grad()
-def test_draft_policy_branches_preserve_scores_draws_and_native_replay(batch, vocab, dtype, compiled, prefix):
+def test_draft_policy_branches_preserve_scores_draws_and_native_replay(batch, vocab, dtype, compiled, prefix,
+                                                                       draft_temperature):
     from ignition.components.draft_sampling import PreparedDraftDistribution
     from ignition.components.sampling import DeviceRequestState, RUNNING
     from ignition.preparation.compilation import compile_forward
@@ -117,7 +124,8 @@ def test_draft_policy_branches_preserve_scores_draws_and_native_replay(batch, vo
     operations = []
     for reference in (True, False):
         operation = PreparedDraftDistribution(logits, state, slots, generations, live, candidates,
-            seed=seed, offset=offset, sampled=torch.zeros_like(seed), prefix_offset=prefix)
+            seed=seed, offset=offset, sampled=torch.zeros_like(seed), prefix_offset=prefix,
+            draft_temperature=draft_temperature)
         operation.prepare()
         if reference:
             score, finish = operation._score_kernels

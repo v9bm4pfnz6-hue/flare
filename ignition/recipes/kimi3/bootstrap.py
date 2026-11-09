@@ -28,7 +28,7 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
                                               create_all_reduce_runtime, create_single_round_all_reduce_runtime,
-                                              create_head_exchange)
+                                              create_dma_all_reduce_runtime, create_head_exchange)
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.capture import capture_forwards
@@ -45,7 +45,7 @@ from ignition.preparation.tuning import RecordedPreparationSession, with_autotun
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
-from .config import PAGE_TOKENS, LatentDSparkConfig
+from .config import PAGE_TOKENS, LatentDSparkConfig, padded_width
 from ignition.recipes.kimi31.dflash_config import DFlash2Config
 from .contract import prepare as prepare_contract
 from .decoder import DecoderStorage, PreparedDecoder, Scratch, retained_auxiliary_rows
@@ -59,6 +59,17 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
 # Most rows of one all-reduce; larger prefill reductions run in chunks of this many rows.
 REDUCE_ROWS = 1024
+
+
+# The copy-engine ring wins above roughly a megabyte of payload: measured on nine GPUs at 7168
+# columns, a 9-row reduction costs 0.170 ms on the ring against 0.089 ms hierarchical, while
+# 128 rows costs 0.345 ms against 0.882 ms. Smaller prefill graphs keep the hierarchical channel
+# because the ring's fixed round trip dominates below one megabyte.
+DMA_PREFILL_MIN_BYTES = 1 << 20
+
+
+def _prefill_uses_dma(world_size, rows, hidden):
+    return world_size == 9 and (rows * hidden) % (world_size * 8) == 0
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,7 @@ class PreparationConfig:
     devices: tuple[int, ...] = tuple(range(16))
     context: int = 1048576
     prefill_chunk_size: int = 4096
+    prefill_graph_capacities: tuple[int, ...] | None = None
     max_active: int = 4
     snapshot_budget_bytes: int = 4 << 30
     headroom_bytes: int = 4 << 30
@@ -84,6 +96,7 @@ class PreparationConfig:
     # Red Hat DSpark checkpoint, either external or in the target's dspark directory.
     draft_checkpoint: Path | None = None
     draft_head_quantization: str | None = None
+    draft_temperature: float = 1.
     # Verification widths count the pending input and up to seven drafts.
     speculative_widths: tuple[int, ...] = tuple(range(1, 9))
     speculative_fixed_width: int | None = None
@@ -103,6 +116,8 @@ class PreparationConfig:
             raise ValueError("Kimi draft head conversion must be mxfp8 or nvfp4")
         if self.draft_head_quantization is not None and not self.drafting:
             raise ValueError("Kimi draft head conversion requires draft weights")
+        if not 0 < self.draft_temperature < float("inf"):
+            raise ValueError("Kimi draft temperature must be finite and positive")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("Kimi K3 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
@@ -115,9 +130,9 @@ class PreparationConfig:
                 raise ValueError("image concurrency must be zero or omitted when vision is disabled")
             images = 0
         object.__setattr__(self, "image_concurrency", images)
-        if (len(self.devices) not in (8, 16) or len(set(self.devices)) != len(self.devices)
+        if (len(self.devices) not in (8, 9, 16) or len(set(self.devices)) != len(self.devices)
                 or any(d < 0 for d in self.devices)):
-            raise ValueError("Kimi preparation requires eight or sixteen distinct GPUs")
+            raise ValueError("Kimi preparation requires eight, nine or sixteen distinct GPUs")
         request_capacity(self.max_active)
         if self.drafting:
             if not self.speculative_widths or not set(self.speculative_widths) <= set(range(1, 9)):
@@ -125,12 +140,27 @@ class PreparationConfig:
             if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
                 raise ValueError("fixed verification width must belong to the captured widths")
             _ = self.speculative_round_shapes
-        if not self.page_tokens <= self.context <= 1048576 or self.context % self.page_tokens:
-            raise ValueError(f"Kimi K3 context must be {self.page_tokens}-aligned in [{self.page_tokens},1048576]")
+        if not self.page_tokens <= self.context <= 1048576 or self.context % 128:
+            raise ValueError(f"Kimi K3 context must be 128-aligned in [{self.page_tokens},1048576]")
         if not 128 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 128:
             raise ValueError("Kimi K3 prefill chunk must be 128-aligned and fit the context")
+        selected = prefill_capacities(self.prefill_chunk_size) if self.prefill_graph_capacities is None else self.prefill_graph_capacities
+        if (not isinstance(selected, tuple) or not selected or tuple(sorted(set(selected))) != selected
+                or any(type(capacity) is not int for capacity in selected)
+                or not set(selected) <= set(prefill_capacities(self.prefill_chunk_size))
+                or selected[-1] != self.prefill_chunk_size):
+            raise ValueError("Kimi prefill graph selection must be distinct increasing standard capacities, including the chunk")
+        object.__setattr__(self, "prefill_graph_capacities", selected)
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
+
+    @property
+    def decode_channel_rows(self):
+        return max(min(max(self.prefill_chunk_size, self.decode_tokens), REDUCE_ROWS), self.decode_tokens)
+
+    @property
+    def prefill_gather_rows(self):
+        return self.decode_channel_rows
 
     @property
     def drafting(self):
@@ -205,7 +235,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
     if snapshots < 1:
         raise ValueError("snapshot budget must hold a complete Kimi K3 continuation")
-    slots, blocks = request_capacity(config.max_active), config.context // config.page_tokens
+    slots, blocks = request_capacity(config.max_active), -(-config.context // config.page_tokens)
     drafting = weights.draft is not None
     max_tokens = max(config.prefill_chunk_size, config.decode_tokens)
     state_rows = slots + snapshots
@@ -228,23 +258,36 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
         # Serial embedding and context gathers share bounded row staging.
-        channel_rows = max(min(max_tokens, REDUCE_ROWS), config.decode_tokens)
+        channel_rows = config.decode_channel_rows
+        prefill_gather_rows = config.prefill_gather_rows
         from b12x.comm.pcie.pcie_twoshot_bf16 import SUPPORTED_WORLD_SIZES
 
-        # Prefill uses complete FP32 owner sums over original BF16 inputs. Keep
-        # decode/verification and small control reductions on their own channel.
+        # Aligned prefill chunks can use the copy-engine ring with FP32 owner packets instead of
+        # the main channel. Only a world without that ring has to size its channel for a complete
+        # prefill chunk, because TP9's direct channel then also serves prefill reductions.
+        dma_prefill = _prefill_uses_dma(shard.world_size, config.prefill_chunk_size, weights.config.hidden)
         reduction_rows = config.decode_tokens if shard.world_size in SUPPORTED_WORLD_SIZES else channel_rows
+        if shard.world_size == 9 and not dma_prefill:
+            reduction_rows = config.prefill_chunk_size
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=reduction_rows, hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
-        prefill_collective = (create_single_round_all_reduce_runtime(group, device,
+        prefill_collective = (create_dma_all_reduce_runtime(group, device,
             max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
-            ipc=package_storage.peer_storage)
+            ipc=package_storage.peer_storage, wire_mode="") if dma_prefill else
+            create_single_round_all_reduce_runtime(group, device,
+                max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
+                ipc=package_storage.peer_storage)
             if shard.world_size in SUPPORTED_WORLD_SIZES else None)
+        text = weights.config.text
+        local_vocabulary = padded_width(weights.config.vocabulary, shard.world_size, 64)
+        local_hidden = padded_width(weights.config.hidden, shard.world_size, 64)
+        local_latent = padded_width(text["routed_expert_hidden_size"], shard.world_size, 32)
+        local_router = padded_width(text["num_experts"], shard.world_size, 8)
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
-            columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
-        embedding_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
-            columns=weights.config.hidden, ipc=package_storage.peer_storage)
+            columns=local_vocabulary * shard.world_size, ipc=package_storage.peer_storage)
+        embedding_collective = create_all_gather_runtime(group, device, max_rows=prefill_gather_rows,
+            columns=local_hidden * shard.world_size, ipc=package_storage.peer_storage)
         context_collective = markov_collective = draft_context_collective = convolution_collective = None
         if drafting:
             # Embedding lookup and accepted-feature projection run serially and
@@ -252,19 +295,18 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             context_collective = embedding_collective
             if isinstance(weights.config.draft, DFlash2Config):
                 draft_context_collective = create_head_exchange(group, device, max_rows=channel_rows,
-                    heads=shard.world_size, head_dim=(weights.config.draft.layers*576//shard.world_size+7)//8*8,
+                    heads=shard.world_size, head_dim=padded_width(weights.config.draft.layers * 576, shard.world_size, 8),
                     ipc=package_storage.peer_storage)
                 convolution_collective = create_head_exchange(group, device,
                     max_rows=slots*(config.draft_tokens+1), heads=shard.world_size,
-                    head_dim=4*weights.config.hidden//16//shard.world_size, ipc=package_storage.peer_storage)
+                    head_dim=padded_width(4 * weights.config.hidden // 16, shard.world_size, 8), ipc=package_storage.peer_storage)
             else:
                 markov_collective = create_all_gather_runtime(group, device, max_rows=slots,
-                    columns=2 * weights.config.vocabulary, ipc=package_storage.peer_storage)
+                    columns=2 * local_vocabulary * shard.world_size, ipc=package_storage.peer_storage)
         # Prefill rows beyond a channel's capacity gather in chunks, as they reduce.
-        router_columns = 2 * shard.world_size * ((weights.config.text["num_experts"] // shard.world_size + 31) // 32 * 32)
-        router_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
-            columns=router_columns,
-            ipc=package_storage.peer_storage)
+        router_columns = 2 * shard.world_size * ((local_router + 31) // 32 * 32)
+        router_collective = create_all_gather_runtime(group, device, max_rows=prefill_gather_rows,
+            columns=router_columns, ipc=package_storage.peer_storage)
         vision_collectives = {}
         if config.vision and weights.vision.shard.world_size > 1:
             from .vision import HEAD_SIZE, INTERMEDIATE, VISION_HEADS
@@ -280,13 +322,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 vision_collectives[columns] = runtime
         route_collective = (create_route_runtime(group, device, ipc=package_storage.peer_storage)
                             if shard.world_size > 1 else None)
+        prefill_route_collective = (create_head_exchange(group, device, max_rows=prefill_gather_rows,
+            heads=shard.world_size, head_dim=local_latent + 2 * local_router,
+            ipc=package_storage.peer_storage) if shard.world_size == 9 else None)
         context = None
         if config.context_parallel and shard.world_size > 1:
             from .dcp import RECORD_BYTES, ContextParallel, ContextShards
             from .dsa import SELECTION_ROWS, TOPK
 
             # Decode and verification gather every rank's absorbed E4M3 query heads and combine latent outputs.
-            heads = weights.config.text["num_attention_heads"]
+            heads = padded_width(text["num_attention_heads"], shard.world_size) * shard.world_size
             sparse = "dsa" in weights.config.layers
             selection_rows = min(max_tokens, SELECTION_ROWS)
             draft_rows = (request_capacity(config.max_active) * config.draft_tokens
@@ -316,11 +361,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                         row_bytes=(32//shard.world_size)*132, ipc=package_storage.peer_storage))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
         # eight rows, as vLLM's b12x latent transport carries, and one that prefill steps use in chunks.
-        text = weights.config.text
-        latent = (text["q_lora_rank"] + text["kv_lora_rank"] + text["qk_rope_head_dim"]) // shard.world_size
+        latent = padded_width(text["q_lora_rank"], shard.world_size) + padded_width(
+            text["kv_lora_rank"] + text["qk_rope_head_dim"], shard.world_size)
         latent_runtimes = tuple(create_head_exchange(group, device, max_rows=rows, heads=shard.world_size,
                                                      head_dim=-(-latent // 8) * 8, ipc=package_storage.peer_storage)
-                                for rows in sorted({min(8, max_tokens), channel_rows}))
+                                for rows in sorted({min(8, max_tokens), prefill_gather_rows}))
         identity = hashlib.sha256(json.dumps({
             "config": weights.config.text, "headers": headers, "vision": weights.config.vision,
             "draft": None if not drafting else weights.config.draft.raw,
@@ -395,7 +440,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             with deferred_pool:
                 vision_inputs = VisionInputs.allocate(device)
                 vision_state = VisionState(inputs, vision_prefill, requests, image_slots=config.image_concurrency,
-                                           image_token=163605, features=FEATURES, hidden=HIDDEN // shard.world_size)
+                    image_token=163605, features=FEATURES, hidden=padded_width(HIDDEN, shard.world_size, 64))
         vision_buffers = {} if not patches else {**vision_inputs.buffers(), **vision_prefill.buffers()}
         buffers = dict(inputs.buffers(), **vision_buffers, **commands.buffers(),
             **{name: getattr(admission, name) for name in admission.__dataclass_fields__},
@@ -415,9 +460,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "mla": {"output": mla_output}, "dsa": {"output": mla_output}, "moe": {"output": moe_output},
         "local_embedding": cursor.zeros((max_tokens, weights.embedding.shape[1]), torch.bfloat16),
         **({"auxiliary": auxiliary[0]} if drafting else {})})
-    prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
+    prefill_sizes, batch_sizes = config.prefill_graph_capacities, batch_capacities(config.max_active)
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
-        route_runtime=route_collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
+        route_runtime=route_collective, prefill_route_runtime=prefill_route_collective,
+        vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
         vision_state=vision_state, context=context, latent_runtimes=latent_runtimes)
     speculation = None
     if drafting:
@@ -432,7 +478,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage, completion=completion,
             frame=frame, sequence=sequence, session=session, workspace=arena, collectives=collectives,
             decoder_buffers=decoder_buffers, draft_tokens=config.draft_tokens, context_runtime=context_collective,
-            page_tokens=config.page_tokens, **extra)
+            page_tokens=config.page_tokens, draft_temperature=config.draft_temperature, **extra)
     modes = (True, False) if drafting else (False,)
     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes)) + len(batch_sizes)
              + len(config.speculative_round_shapes) + len(patches))
@@ -457,11 +503,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
                     m = metadata[name] = Metadata.allocate(capacity, rows, blocks, device)
                     scratch = (prefill_storage if mode == "prefill" else decode_storage).rows(capacity, rows)
+                    prefill_runtime = (prefill_collective if mode == "prefill"
+                                       and prefill_collective is not None
+                                       and (capacity == config.prefill_chunk_size if not dma_prefill
+                                            else capacity * weights.config.hidden * 2 >= DMA_PREFILL_MIN_BYTES)
+                                       else collective)
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
                         session=session, name=name, workspace=arena, buffers=decoder_buffers,
-                        **dict(collectives, runtime=(prefill_collective if mode == "prefill"
-                                                   and prefill_collective is not None else collective)))
+                        **dict(collectives, runtime=prefill_runtime))
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)
@@ -503,7 +553,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 chunk_rows=min(1024, channel_rows))
             vision_encoders.append(encoder)
             forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence,
-                                                feature_range=shard.partition(HIDDEN), buffers=cursor)
+                                                feature_range=shard.padded_partition(HIDDEN, alignment=64), buffers=cursor)
             add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
@@ -626,7 +676,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
-                   vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_collective,
+                   vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_route_collective,
+                   prefill_collective,
                    vision_inputs, vision_prefill, vision_state, vision_storage, deferred_pool, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes,
                    draft_context_collective, convolution_collective, vision_collectives))

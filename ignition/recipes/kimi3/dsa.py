@@ -12,7 +12,7 @@ from ignition.components.distributed_topk import PreparedDistributedTopK, select
 from ignition.components.fp8_indexer import PreparedFP8Indexer
 
 from .config import PAGE_TOKENS
-from .dcp import ContextShards, RECORD_BYTES, pull_context
+from .dcp import ContextShards, RECORD_BYTES, lse_geometry, pull_context
 from .projections import prepare_projection
 
 # Slice selection and its cross-rank candidate exchange so prefill scratch is context-independent.
@@ -131,8 +131,10 @@ class PreparedDSA:
                 else:
                     gather = PreparedAllGather(quantized.view(count, -1), q.view(count, -1), runtime=context.heads,
                         coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
+                threads, block_limit = lse_geometry(count, self.shards.world)
                 combine = PreparedLseReduceScatter(attended, lse, output[begin:end], runtime=context.heads,
-                    session=session, coordinator=coordinator, name=stage_name + ".combine", threads=512, block_limit=8)
+                    session=session, coordinator=coordinator, name=stage_name + ".combine",
+                    threads=threads, block_limit=block_limit)
             else:
                 quantized = lse = None
             caps = dense_mla.Caps(device=device, mode="decode", q_dtype=q.dtype, kv_dtype=cache.dtype,

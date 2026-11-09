@@ -11,6 +11,32 @@ import re
 
 from ignition.components.parallel import TensorParallelShard
 
+
+def padded_width(extent, world_size, alignment=1):
+    """Equal aligned rank widths, including the zero-filled tail of a non-divisible extent."""
+    return -(-extent // (world_size * alignment)) * alignment
+
+
+def expert_intermediate_range(shard, layer_index, intermediate_size):
+    """Rotate complete 128-channel expert blocks across nine ranks without splitting Hadamard extents."""
+    alignment = 128
+    if shard.world_size != 9:
+        return shard.partition(intermediate_size, alignment=alignment)
+    if intermediate_size % (2 * alignment):
+        raise ValueError("TP9 expert rotation requires two aligned intermediate halves")
+    owner = (shard.rank - layer_index) % shard.world_size
+    if owner < 5:
+        half, half_rank, ranks_in_half = 0, owner, 5
+    else:
+        half, half_rank, ranks_in_half = 1, owner - 5, 4
+    blocks_per_half = intermediate_size // (2 * alignment)
+    quotient, remainder = divmod(blocks_per_half, ranks_in_half)
+    blocks = quotient + int(half_rank < remainder)
+    begin = half_rank * quotient + min(half_rank, remainder)
+    first = (half * blocks_per_half + begin) * alignment
+    return first, first + blocks * alignment
+
+
 PAGE_TOKENS = 128
 # Optional speculators-format draft directory within a target checkpoint.
 DRAFT_DIRECTORY = "dspark"
@@ -108,10 +134,10 @@ class DSparkConfig:
         return self.text["rope_parameters"]["rope_theta"]
 
     def validate_shard(self, shard: TensorParallelShard):
-        shard.partition(self.heads)
-        shard.partition(self.kv_heads)
-        shard.partition(self.text["intermediate_size"], alignment=32)
-        shard.partition(self.text["hidden_size"], alignment=8)
+        shard.padded_partition(self.heads)
+        shard.padded_partition(self.kv_heads)
+        shard.padded_partition(self.text["intermediate_size"], alignment=32)
+        shard.padded_partition(self.text["hidden_size"], alignment=8)
 
 
 @dataclass(frozen=True)
@@ -182,7 +208,7 @@ class LatentDSparkConfig:
         for extent, alignment in ((self.heads, 1), (self.raw["hidden_size"], 64),
                 (self.raw["intermediate_size"], 32), (self.raw["q_lora_rank"], 1),
                 (self.raw["kv_lora_rank"] + self.raw["qk_rope_head_dim"], 1)):
-            shard.partition(extent, alignment=alignment)
+            shard.padded_partition(extent, alignment=alignment)
 
 
 @dataclass(frozen=True)
@@ -300,15 +326,17 @@ class ModelConfig:
     def validate_shard(self, shard: TensorParallelShard):
         c = self.text
         if c["quantization_config"].get("quant_method") == "exl3":
-            # Every rank owns complete 128-channel intermediate Hadamard blocks.
-            shard.partition(c["moe_intermediate_size"], alignment=128)
+            for index in range(c["first_k_dense_replace"], c["num_hidden_layers"]):
+                expert_intermediate_range(shard, index, c["moe_intermediate_size"])
+        else:
+            shard.partition(c["moe_intermediate_size"], alignment=32)
         for extent, alignment in ((c["num_attention_heads"], 1),
-                (c["linear_attn_config"]["num_heads"], 1), (c["hidden_size"], 8),
-                (c["routed_expert_hidden_size"], 8), (c["moe_intermediate_size"], 32),
+                (c["linear_attn_config"]["num_heads"], 1), (c["hidden_size"], 64),
+                (c["routed_expert_hidden_size"], 32), (c["moe_intermediate_size"], 32),
                 (c["intermediate_size"], 32), (c["num_shared_experts"] * c["moe_intermediate_size"], 32),
-                (c["num_experts"], 8),
-                (c["vocab_size"], 64)):
-            shard.partition(extent, alignment=alignment)
+                (c["num_experts"], 8), (c["q_lora_rank"], 1),
+                (c["kv_lora_rank"] + c["qk_rope_head_dim"], 1), (c["vocab_size"], 64)):
+            shard.padded_partition(extent, alignment=alignment)
 
     def projection_format(self, name):
         q = self.text["quantization_config"]

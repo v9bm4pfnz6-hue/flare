@@ -16,6 +16,7 @@ from ignition.components.weights import DirectWeightLoader, MLPWeights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 
 from .attention import PreparedMLA
+from .config import padded_width
 from .dcp import ContextShards, RECORD_BYTES, write_records
 from .dspark import projection
 from .pointwise import rms_norm_columns
@@ -88,18 +89,17 @@ class DraftWeights:
         packed = quantize_bf16_linear_as_mxfp8 if online_mxfp8 else lambda x: x
         d, hidden = config.draft, config.hidden
         d.validate_shard(shard)
-        h0, h1 = shard.partition(d.heads)
-        q_range, kv_range = shard.partition(d.text["q_lora_rank"]), shard.partition(RECORD_BYTES)
-        intermediate = shard.partition(d.text["intermediate_size"], alignment=32)
+        h0, h1 = shard.padded_partition(d.heads)
+        q_range, kv_range = shard.padded_partition(d.text["q_lora_rank"]), shard.padded_partition(RECORD_BYTES)
+        intermediate = shard.padded_partition(d.text["intermediate_size"], alignment=32)
         with DirectWeightLoader(inspect_indexed_checkpoint(snapshot), device, progress=progress,
                                 progress_label="Load draft weights") as loader:
             def matrix(name, rows=None, columns=None):
-                value = loader.load_tensor(name + ".weight", extent=(slice(*(rows or (None, None))),
-                    slice(*(columns or (None, None)))))
+                value = loader.load_padded_tensor(name + ".weight", rows=rows, columns=columns)
                 if value.ndim != 2 or value.dtype != torch.bfloat16:
                     raise ValueError(f"latent DSpark requires BF16 matrices: {name}")
                 return value
-            project = matrix("context_proj", rows=shard.partition(hidden, alignment=64))
+            project = matrix("context_proj", rows=shard.padded_partition(hidden, alignment=64))
             if project.shape[1] != hidden * len(d.auxiliary_layers):
                 raise ValueError("draft context projection does not match the selected target features")
             hidden_norm, norm = loader.load_tensors(("context_norm.weight", "final_norm.weight"))
@@ -124,7 +124,7 @@ class DraftWeights:
                 layers.append(LayerWeights(attention, loader.load_tensor(prefix + ".input_layernorm.weight"),
                     loader.load_tensor(prefix + ".post_attention_layernorm.weight"), mlp))
             markov_embedding = matrix("markov_head.markov_w1")
-            markov_head = matrix("markov_head.markov_w2", rows=shard.partition(config.vocabulary, alignment=64))
+            markov_head = matrix("markov_head.markov_w2", rows=shard.padded_partition(config.vocabulary, alignment=64))
             if markov_embedding.shape != (config.vocabulary, d.markov_rank) or markov_head.shape[1] != d.markov_rank:
                 raise ValueError("draft Markov projections disagree with their declared rank")
         # The checkpoint declares a confidence head; shared proposal sampling computes its own probabilities.
@@ -147,9 +147,9 @@ class DraftScratch:
     def allocate(cls, config, shard, tokens, block, device):
         def zeros(columns):
             return torch.zeros((tokens, columns), device=device, dtype=torch.bfloat16)
-        return cls(zeros(config.hidden // shard.world_size), zeros(config.hidden), zeros(config.hidden),
-            MLPScratch.allocate(tokens, config.hidden, config.draft.text["intermediate_size"] // shard.world_size, device),
-            zeros(config.hidden), zeros(config.vocabulary // shard.world_size), zeros(config.vocabulary), {})
+        return cls(zeros(padded_width(config.hidden, shard.world_size, 64)), zeros(config.hidden), zeros(config.hidden),
+            MLPScratch.allocate(tokens, config.hidden, padded_width(config.draft.text["intermediate_size"], shard.world_size, 32), device),
+            zeros(config.hidden), zeros(padded_width(config.vocabulary, shard.world_size, 64)), zeros(config.vocabulary), {})
 
     def rows(self, tokens, samples):
         if samples != tokens or not 0 < tokens <= self.embedding.shape[0]:
@@ -194,7 +194,7 @@ class PreparedContext:
             if key not in buffers or buffers[key].shape[0] < rows:
                 buffers[key] = torch.zeros((rows, columns), dtype=dtype, device=device)
             return buffers[key][:rows]
-        self.local = buffer("local", hidden // weights.shard.world_size)
+        self.local = buffer("local", padded_width(hidden, weights.shard.world_size, 64))
         self.projected, self.normalized = buffer("projected", hidden), buffer("normalized", hidden)
         self.project = projection(auxiliary, weights.draft.projection, self.local,
             session=session, name=name + ".project", workspace=workspace)

@@ -44,6 +44,7 @@ def resolve_model(configuration: Configuration, name: str | None) -> ResolvedMod
 
 def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gpus: str | None,
            concurrency: Setting, speculation: Speculation | None, prefill_chunk: int | None = None,
+           prefill_graph_capacities: tuple[int, ...] | None = None,
            context_parallel: bool = True, stream_overlap: bool = True, roce_ring: bool = False, roce_chain: bool = False,
            mixed_prefill: bool = False, prompt_logprobs: bool = False, expert_scale_compression: str | None = None,
            online_mxfp8: bool = False, language_model_only: bool = False,
@@ -61,7 +62,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
     result = planning.plan(
         model.recipe, model.checkpoint, host.gpus, selected=None if gpus is None else planning.parse_gpus(gpus),
         concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes, speculation=speculation,
-        prefill_chunk=prefill_chunk, context_parallel=context_parallel, stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
+        prefill_chunk=prefill_chunk, prefill_graph_capacities=prefill_graph_capacities,
+        context_parallel=context_parallel, stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
         online_mxfp8=online_mxfp8, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
@@ -173,6 +175,7 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None),
         ("--draft-head-quantization", getattr(args, "draft_head_quantization", None)),
         ("--markov-head-quantization", getattr(args, "markov_head_quantization", None)),
+        ("--draft-temperature", args.draft_temperature),
         ("--vocabulary-parallel-sampling", getattr(args, "vocabulary_parallel_sampling", False) or None)) if value is not None]
     if explicit_graph_budget:
         given.append("--speculative-graph-budget")
@@ -187,6 +190,8 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
 
     if method is not None and method != default.method and method not in recipe.speculative_methods:
         raise UsageError(f"--speculative-method {method}: {alias} does not prepare this proposal method")
+    if args.draft_temperature is not None and recipe.name not in ("kimi3", "kimi31"):
+        raise UsageError("--draft-temperature requires Kimi K3 or K3.1")
     drafts = default.draft_tokens if args.mtp_draft_tokens is None else args.mtp_draft_tokens
     if not 0 <= drafts <= limit:
         raise UsageError(f"--mtp-draft-tokens must be 0 through {limit}; --no-mtp disables speculation")
@@ -210,12 +215,13 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         raise UsageError("--speculative-graph-budget must be a positive integer")
     draft_head = getattr(args, "draft_head_quantization", None)
     markov_head = getattr(args, "markov_head_quantization", None)
-    if (draft_head or markov_head) and drafts < 1:
-        raise UsageError("draft head quantization requires positive learned draft depth")
+    if (draft_head or markov_head or args.draft_temperature is not None) and drafts < 1:
+        raise UsageError("draft proposal options require positive learned draft depth")
     return Speculation(drafts, adaptive, token_capacity=capacity, packed_verification=packed,
                        draft_prefix_selection=prefix_selection, graph_budget=budget,
                        draft_head_quantization=draft_head, markov_head_quantization=markov_head,
-                       vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False), method=method)
+                       vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False), method=method,
+                       draft_temperature=args.draft_temperature)
 
 
 def fetch(model: ResolvedModel, hub_cache, *, progress_bars: bool = True) -> str:

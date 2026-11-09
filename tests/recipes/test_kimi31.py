@@ -88,8 +88,9 @@ def test_gather_thread_tuning_keeps_other_kimi_collective_settings():
     from ignition.recipes.kimi3.recipe import RECIPE as KIMI3
 
     assert KIMI3.b12x_environment["B12X_PCIE_DCP_THREADS"] == "512"
-    assert RECIPE.b12x_environment == {**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}
-    assert RECIPE.b12x_environment["B12X_PCIE_DCP_BLOCK_LIMIT"] == "8"
+    assert RECIPE.b12x_environment == {**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0",
+                                       "B12X_PCIE_DCP_BLOCK_LIMIT": "64"}
+    assert RECIPE.b12x_environment["B12X_PCIE_DCP_BLOCK_LIMIT"] == "64"
 
 
 def test_exl3_keeps_sparse_attention_and_bf16_projections(raw):
@@ -130,6 +131,37 @@ def test_tp8_costs_match_complete_history_layout(raw):
     assert page_bytes(config) == RECIPE.ranks[8].page_bytes
 
 
+def test_tp9_costs_match_complete_history_layout(raw):
+    config = ModelConfig.from_dict(raw)
+    assert continuation_layout(config, 9).row_bytes == RECIPE.plain_ranks[9].state_row_bytes
+    assert page_bytes(config) == RECIPE.plain_ranks[9].page_bytes
+    draft = DSparkConfig.from_dict(json.loads((FIXTURES / "draft-config.json").read_text()), config.text)
+    config = replace(config, draft=draft)
+    assert continuation_layout(config, 9, speculative_tokens=7).row_bytes == RECIPE.ranks[9].state_row_bytes
+    assert page_bytes(config) == RECIPE.ranks[9].page_bytes
+
+
+def test_tp9_expert_rotation_covers_every_hadamard_extent_without_empty_ranks(raw):
+    from ignition.recipes.kimi3.config import expert_intermediate_range
+
+    raw["text_config"]["quantization_config"] = {"quant_method": "exl3", "dense_format": "bf16",
+        "exl3": {"manifest": "exl3-manifest.json"}}
+    config = ModelConfig.from_dict(raw)
+    resident = [0] * 9
+    for index in range(config.text["first_k_dense_replace"], config.text["num_hidden_layers"]):
+        ranges = [expert_intermediate_range(TensorParallelShard(rank, 9), index, 3072) for rank in range(9)]
+        for rank, (first, last) in enumerate(ranges):
+            assert first % 128 == 0 and last > first
+            assert (first // 32) % 4 == 0
+            assert first // 1536 == (last - 1) // 1536
+            resident[rank] += (last - first) // 32
+        covered = [channel for first, last in ranges for channel in range(first, last, 128)]
+        assert sorted(covered) == list(range(0, 3072, 128))
+        config.validate_shard(TensorParallelShard(0, 9))
+    assert max(resident) == 984 and min(resident) > 0
+
+
+
 def test_tp8_preparation_keeps_context_parallel_page_geometry():
     from ignition.recipes.kimi3.bootstrap import PreparationConfig
 
@@ -152,9 +184,189 @@ def test_tuning_rows_cover_recurrence_without_snapshot_destinations(concurrency,
     assert config.tuning_state_rows >= 3  # Null, one prefill state and its checkpoint.
 
 
+def test_tp9_preparation_covers_the_partial_final_context_page():
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig
+
+    config = PreparationConfig(devices=tuple(range(9)), prefill_chunk_size=128,
+        max_active=1, vision=False, speculative_widths=())
+    assert config.context == 1048576
+    assert config.page_tokens == 1152
+    assert -(-config.context // config.page_tokens) == 911
+    with pytest.raises(ValueError, match="128-aligned"):
+        replace(config, context=config.context - 1)
+
+
+def test_tp9_preparation_preserves_neutral_draft_temperature_by_default():
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig
+
+    config = PreparationConfig(devices=tuple(range(9)), max_active=1, vision=False)
+    assert config.draft_temperature == 1.
+    assert replace(config, draft_temperature=.7).draft_temperature == .7
+    for temperature in (0., -1., float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            replace(config, draft_temperature=temperature)
+
+
 def test_exl3_rejects_shards_that_split_intermediate_hadamard_blocks(raw):
     raw["text_config"]["quantization_config"] = {"quant_method": "exl3", "dense_format": "bf16",
         "exl3": {"manifest": "exl3-manifest.json"}}
     config = ModelConfig.from_dict(raw)
     with pytest.raises(ValueError, match="aligned rank partitions"):
         config.validate_shard(TensorParallelShard(0, 16))
+
+
+@pytest.mark.parametrize("rows", (1, 8, 16, 32))
+def test_tp9_route_gather_declares_all_speculative_rows(monkeypatch, rows):
+    import torch
+    from types import SimpleNamespace
+    from b12x.comm import pcie
+    from ignition.preparation.scratch import GraphBufferPool
+    from ignition.recipes.kimi3 import routing
+    from ignition.recipes.kimi3.config import padded_width
+
+    down_width = padded_width(3584, 9, 32)
+    router_width = padded_width(896, 9, 8)
+    runtime = SimpleNamespace(world_size=9, query_head_dim=2 * down_width + 4 * router_width,
+                              exchange_group=object())
+    plan = SimpleNamespace(request=lambda **kwargs: object())
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: tuple(range(9)))
+    monkeypatch.setattr(pcie, "query_from_runtime", lambda runtime, **kwargs: kwargs)
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: plan)
+    monkeypatch.setattr(routing, "declare", lambda *args, **kwargs: None)
+
+    def make(count, buffers, allocator):
+        return routing.PreparedRouteGather(
+            torch.zeros((count, down_width), dtype=torch.bfloat16),
+            torch.zeros((count, router_width), dtype=torch.float32), torch.zeros(896, dtype=torch.float32),
+            torch.zeros((count, 3584), dtype=torch.bfloat16), torch.zeros((count, 16), dtype=torch.float32),
+            torch.zeros((count, 16), dtype=torch.int32), runtime=runtime, session=None, coordinator=None,
+            name=f"route-{count}", buffers=buffers, allocator=allocator)
+
+    pool = GraphBufferPool("cpu", chunk_bytes=256)
+    buffers = {}
+    largest = make(32, buffers, pool.cursor())
+    nbytes = pool.nbytes
+    gather = make(rows, buffers, pool.cursor())
+
+    assert gather.rows == rows and gather.fused is None
+    assert gather.logits.shape == (rows, 896)
+    assert gather.gathered_latent.shape == (rows, down_width * 9)
+    assert gather.gathered_logits.shape == (rows, router_width * 9)
+    assert pool.nbytes == nbytes
+    for field in ("logits", "gathered_latent", "gathered_logits"):
+        assert getattr(gather, field).untyped_storage().data_ptr() == getattr(largest, field).untyped_storage().data_ptr()
+
+
+def test_tp9_route_gather_rejects_rows_above_capacity():
+    import torch
+    from types import SimpleNamespace
+    from ignition.recipes.kimi3.config import padded_width
+    from ignition.recipes.kimi3.routing import PreparedRouteGather
+
+    down_width, router_width = padded_width(3584, 9, 32), padded_width(896, 9, 8)
+    runtime = SimpleNamespace(world_size=9, query_head_dim=2 * down_width + 4 * router_width)
+    with pytest.raises(ValueError, match="1-32"):
+        PreparedRouteGather(torch.zeros((33, down_width), dtype=torch.bfloat16),
+            torch.zeros((33, router_width), dtype=torch.float32), torch.zeros(896),
+            torch.zeros((33, 3584), dtype=torch.bfloat16), torch.zeros((33, 16)), torch.zeros((33, 16), dtype=torch.int32),
+            runtime=runtime, session=None, coordinator=None, name="too-wide")
+
+
+def test_tp9_router_fallback_reassembles_padded_rank_partitions(monkeypatch):
+    import torch
+    from ignition.recipes.kimi3 import decoder
+
+    mlp = decoder.PreparedLatentMoE.__new__(decoder.PreparedLatentMoE)
+    mlp.route_gather = None
+    mlp.prefill_route_gather = None
+    source = torch.zeros((2, 8), dtype=torch.bfloat16)
+    mlp.router_projection = lambda value: torch.ones((2, 100), dtype=torch.float32)
+    mlp.router_input = torch.zeros((2, 128), dtype=torch.float32)
+    mlp.router_gather = lambda value: None
+    mlp.gathered_logits = torch.zeros((2, 9 * 128), dtype=torch.float32)
+    for rank in range(9):
+        begin = rank * 128
+        mlp.gathered_logits[:, begin:begin + 100] = torch.arange(rank * 100, rank * 100 + 100)
+    mlp.router_columns = mlp.gathered_logits.view(2, 9, 128)[:, :, :100]
+    mlp.router_output = torch.empty((2, 9, 100), dtype=torch.float32)
+    mlp.router_logits = torch.empty((2, 896), dtype=torch.float32)
+    expected = torch.arange(896, dtype=torch.float32).expand(2, 896)
+    mlp.router = lambda logits: torch.testing.assert_close(logits, expected)
+    mlp.source = torch.empty_like(source)
+    mlp.hidden_columns = torch.arange(8)
+    latent = torch.ones((2, 32), dtype=torch.bfloat16)
+    mlp.down = lambda value: latent
+    mlp.down_reduce = lambda value: None
+    mlp.latent = latent
+    mlp.latent_sum = latent
+    mlp.experts = lambda: latent
+    mlp.expert_reduce = lambda value: None
+    mlp.latent_norm = torch.ones(32, dtype=torch.bfloat16)
+    mlp.up_input = torch.empty_like(latent)
+    mlp.latent_begin = torch.tensor([0], dtype=torch.int32)
+    mlp.eps = 1e-6
+    mlp.up = lambda value: None
+    mlp.output = torch.zeros_like(source)
+    mlp.shared = lambda value: torch.zeros_like(source)
+    mlp.shared.concurrent = False
+    monkeypatch.setattr(decoder, "rms_norm_columns", lambda source, norm, output, eps, begin: output.copy_(source))
+
+    result = mlp(source)
+
+    assert result is mlp.output
+    torch.testing.assert_close(mlp.router_logits, expected)
+
+
+
+def test_tp9_prefill_graph_selection_preserves_default_and_explicit_subset():
+    from ignition.components.capacity import prefill_capacities
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig
+
+    config = PreparationConfig(devices=tuple(range(9)), max_active=4, vision=False)
+    assert config.prefill_graph_capacities == prefill_capacities(4096)
+    selected = replace(config, prefill_graph_capacities=(128, 4096))
+    assert selected.prefill_graph_capacities == (128, 4096)
+    for capacities in ((), (128,), (4096, 128), (128, 512), (128, 384, 4096)):
+        with pytest.raises(ValueError, match="prefill graph selection"):
+            replace(config, prefill_graph_capacities=capacities)
+
+
+def test_tp9_prefill_gather_uses_bounded_decode_channel(monkeypatch):
+    import torch
+    from b12x.comm.pcie import DcpAllToAll
+    from ignition.preparation.collectives import create_all_gather_runtime, create_head_exchange
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig
+
+    config = PreparationConfig(devices=tuple(range(9)), max_active=4, vision=False)
+    assert config.decode_channel_rows == 1024
+    assert config.prefill_gather_rows == 1024
+    assert replace(config, devices=tuple(range(8))).prefill_gather_rows == 1024
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: len(config.devices))
+    monkeypatch.setattr(DcpAllToAll, "from_exchange_group", classmethod(lambda cls, **kwargs: kwargs))
+    group, device = object(), torch.device("cpu")
+    embedding = create_all_gather_runtime(group, device, max_rows=config.prefill_gather_rows, columns=9 * 64)
+    latent = create_head_exchange(group, device, max_rows=config.prefill_gather_rows, heads=9, head_dim=64)
+    decode = create_head_exchange(group, device, max_rows=config.decode_channel_rows, heads=9, head_dim=64)
+    assert embedding["max_batch_size"] == 1024
+    assert latent["max_batch_size"] == 1024
+    assert decode["max_batch_size"] == 1024
+
+
+def test_tp9_dma_prefill_requires_aligned_ring_shards():
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig, _prefill_uses_dma
+
+    for rows, expected in ((128, False), (4096, False), (4608, True), (9216, True)):
+        assert _prefill_uses_dma(9, rows, 7168) is expected
+        assert not _prefill_uses_dma(8, rows, 7168)
+    config = PreparationConfig(devices=tuple(range(9)), max_active=4, vision=False,
+        prefill_chunk_size=4608, prefill_graph_capacities=(128, 4608))
+    assert config.prefill_graph_capacities == (128, 4608)
+
+
+def test_tp9_lse_geometry_uses_measured_rows():
+    from ignition.recipes.kimi3.dcp import lse_geometry
+
+    assert lse_geometry(1, 9) == (512, 16)
+    assert lse_geometry(8, 9) == (512, 8)
+    assert lse_geometry(32, 9) == (384, 32)
+    assert lse_geometry(32, 8) == (512, 8)

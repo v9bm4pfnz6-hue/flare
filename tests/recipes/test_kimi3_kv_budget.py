@@ -38,7 +38,7 @@ def test_recipe_preserves_declared_addressability_beyond_estimated_kv(monkeypatc
         world_size=8, speculation=None, collective_tuning="static", collective_ladder=None,
         prompt_logprobs=False, compile_workers=1, autotune_effort="off", tuning_replica=None,
         native_dense_activations=False, lock_gpu_clocks=False, concurrency=1,
-        image_concurrency=0, prefill_chunk=1024, snapshots=1,
+        image_concurrency=0, prefill_chunk=1024, prefill_graph_capacities=None, snapshots=1,
         costs=SimpleNamespace(state_row_bytes=58_361_088), headroom_bytes=0, reserve_bytes=0,
         online_mxfp8=True, stream_overlap=True, context_parallel=True,
         language_model_only=True, checkpoint=None,

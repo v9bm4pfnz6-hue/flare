@@ -153,6 +153,10 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                           help="most prompt tokens per prefill step; larger chunks reach a long prompt's first"
                                " token sooner and pause other requests longer; a multiple of 64"
                                " (default: see MODEL --help)")
+    capacity.add_argument("--prefill-graph-capacities", metavar="N[,N...]",
+                          type=lambda text: tuple(int(value) for value in text.split(",")),
+                          help="capture only these standard Kimi prefill capacities, including the maximum chunk"
+                               " (default: every standard capacity)")
     capacity.add_argument("--prompt-logprobs", action="store_true",
                           help="capture dedicated prefill graphs for raw prompt token logprobs")
     capacity.add_argument("--mixed-prefill", action="store_true",
@@ -195,6 +199,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--markov-head-quantization", choices=("nvfp4", "fp8"),
                           help="prepare the draft Markov transition projection as NVFP4"
                                " or row-scaled E4M3 FP8 (FP8: DeepSeek V4.1; default: checkpoint precision)")
+    advanced.add_argument("--draft-temperature", type=float, metavar="T",
+                          help="positive proposal-only temperature multiplier; target verification and request"
+                               " sampling retain the request policy (default: 1)")
     advanced.add_argument("--vocabulary-parallel-sampling", action="store_true",
                           help="prepare vocabulary-sharded DSpark proposals and block rejection sampling"
                                " (DeepSeek V4.1; default: full-vocabulary sampling)")

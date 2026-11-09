@@ -1086,17 +1086,25 @@ class DirectWeightLoader:
         self._session.flush()
         return targets
 
-    def load_padded_tensor(self, name: str, *, rows: tuple[int, int]) -> torch.Tensor:
-        """Load checkpoint rows unchanged and zero any partition tail beyond the source."""
+    def load_padded_tensor(self, name: str, *, rows: tuple[int, int] | None = None,
+                           columns: tuple[int, int] | None = None) -> torch.Tensor:
+        """Load checkpoint rows and columns unchanged and zero any partition tail beyond the source."""
         import torch
 
         self._require_open()
         source = self._sources[name]
-        first, last = _aligned_range(rows, max(source.shape[0], rows[1]), 1)
-        target = torch.zeros((last - first, *source.shape[1:]), dtype=source.dtype, device=self.device)
+        first, last = rows or (0, source.shape[0])
+        c0, c1 = columns or (0, source.shape[1] if source.ndim > 1 else 1)
+        if min(first, c0) < 0 or last < first or c1 < c0 or columns is not None and source.ndim != 2:
+            raise ValueError(f"{name}: invalid padded tensor partition")
+        shape = (last - first, c1 - c0, *source.shape[2:]) if source.ndim > 1 else (last - first,)
+        target = torch.zeros(shape, dtype=source.dtype, device=self.device)
         count = max(0, min(last, source.shape[0]) - first)
-        if count:
-            self._copy(target[:count], source[first:first + count])
+        columns_count = max(0, min(c1, source.shape[1] if source.ndim > 1 else 1) - c0)
+        if count and columns_count:
+            extent = (slice(first, first + count), slice(c0, c0 + columns_count)) if source.ndim > 1 else slice(first, first + count)
+            destination = target[:count, :columns_count] if source.ndim > 1 else target[:count]
+            self._copy(destination, source[extent])
         self._session.flush()
         return target
 

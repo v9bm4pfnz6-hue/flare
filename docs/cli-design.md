@@ -188,7 +188,24 @@ continuations into existing graph inputs; it does not change the captured graphs
 record no history preference. Package defaults fill omitted settings; explicit
 startup settings win. Execution ABI labels do not gate loading; engine upgrades
 preserve previously supported model packages. Omitted capacity flags use package
-defaults. Only selected graphs and required kernels load. Continuation rows and KV pages receive physical
+defaults. `--prefill-graph-capacities 128,4096` selects a smaller dedicated
+prefill catalog when both capacities were captured. The list must retain the
+prepared maximum chunk size. Ordinary and scored prefill use the same selected
+capacities; prompts between them use padding or multiple steps. This reduces
+executable graph memory but can increase prefill time for intermediate prompt
+sizes. Omission loads every captured capacity.
+
+For a package captured through 4096 tokens with 128- and 4096-token prefill
+graphs, a complete native launch is:
+
+```sh
+./flare/target/release/flare run /data/flare/models/model.safetensors \
+  --gpus 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --max-concurrency 4 --mtp-draft-tokens 0 \
+  --prefill-graph-capacities 128,4096 --host 127.0.0.1 --port 8000
+```
+
+Only selected graphs and required kernels load. Continuation rows and KV pages receive physical
 storage according to those selections and available GPU memory.
 
 ### GPU graph latency benchmark
@@ -389,11 +406,13 @@ explicit flags take precedence.
 | Flag | Meaning | Default |
 |---|---|---|
 | `--prefill-chunk-size N` | Most prompt tokens processed in one prefill step, a multiple of 64. A larger chunk reaches a long prompt's first token sooner; while it runs, other active requests wait for their next token. Command line only. | The recipe's chunk |
+| `--prefill-graph-capacities N[,N...]` | Capture only these distinct increasing capacities from Kimi's standard prefill catalog, including the maximum chunk. Omission preserves the complete catalog. Package loading selects among the capacities that were captured; it cannot add omitted shapes. Command line only. | All standard capacities |
 | `--mixed-prefill` | Capture mixed prompt/decode graphs alongside separate graphs. Supported by Qwen with concurrency of at least two, with or without speculation. Command line only; existing packages retain their captured catalog. | Disabled |
 | `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, or Step-5 NVFP4 scales including BF16 experts converted to W4A16. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; actual savings depend on encoded scales. A bare flag selects `csf`; `native` disables compression. Retain compressed scales and share expansion scratch across serial layers. | Recipe default: `csf` for DeepSeek V4.1, native otherwise |
 | `--speculative-method {mtp,dflash2}` | Select the recipe's learned proposal method. Flash Next defaults to MTP and also supports its pinned DFlash2 checkpoint; Qwen3.8 dense uses DFlash2. Overrides `[models."MODEL"] speculative_method`, then `[defaults] speculative_method`. The selection is recorded in preparation and rebuild metadata; native serving replays the exported graphs. | Recipe declaration |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
 | `--draft-head-quantization {nvfp4,mxfp8}` | Prepare a separate proposal vocabulary head while retaining target-head precision. NVFP4 supports DeepSeek V4/V4.1; MXFP8 supports DeepSeek V4.1. Qwen3.8 dense supports both when the source checkpoint head is BF16, including `qwen3.8-27b-qad`; the packed NVIDIA head cannot be converted through this option. Flash Next supports both with `--speculative-method dflash2` and a BF16 target vocabulary head. This does not quantize the draft body. | Checkpoint precision |
+| `--draft-temperature T` | Positive multiplier on the proposal-only temperature for Kimi K3/K3.1 bounded draft sampling, after penalties and before top-k/top-p filtering. Target verification and request sampling retain the request temperature. Preparation only; omitted values preserve temperature 1. Fused Markov proposals reject a non-unit value. | 1 |
 | `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Each complete speculative program records its actual proposal depth independently of target width and aggregate rows. Prefix selection uses measured complete-program cost and completed acceptance or confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
 | `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 except Gemma 4, which derives it from concurrency and draft depth (6 at its defaults) |
 | `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for packed recipes |
@@ -649,6 +668,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--served-model-name ALIAS` | Replace the package's serving aliases with this nonblank alias | Package aliases |
 | `--api-key-file PATH` | File containing the serving API key; an empty file disables authentication | `[server] api_key`, otherwise no authentication |
 | `--max-concurrency N` | Reduce concurrency within captured batch capacities | Model/default configuration, otherwise package default |
+| `--prefill-graph-capacities N[,N...]` | Load only these captured dedicated prefill capacities for ordinary and scored prefill. Values must be distinct positive multiples of 64 and retain the prepared maximum chunk. Command line only. Start with `128,4096` on graph-memory constrained hosts when both were captured. | All captured capacities |
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise package serving reserve |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Package default |

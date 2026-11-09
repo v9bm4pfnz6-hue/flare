@@ -202,8 +202,24 @@ class Plan:
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
+    prefill_graph_capacities: tuple[int, ...] | None = None
 
     def __post_init__(self):
+        if (self.speculation is not None and self.speculation.draft_temperature is not None
+                and self.recipe.name not in ("kimi3", "kimi31")):
+            raise UsageError("--draft-temperature requires Kimi K3 or K3.1")
+        if self.prefill_graph_capacities is not None:
+            from ignition.components.capacity import prefill_capacities
+
+            if self.recipe.name not in ("kimi3", "kimi31"):
+                raise UsageError("--prefill-graph-capacities requires Kimi K3 or K3.1")
+            selected = self.prefill_graph_capacities
+            available = prefill_capacities(self.prefill_chunk)
+            if (not isinstance(selected, tuple) or not selected or tuple(sorted(set(selected))) != selected
+                    or any(type(capacity) is not int for capacity in selected)
+                    or not set(selected) <= set(available) or selected[-1] != self.prefill_chunk):
+                raise UsageError("--prefill-graph-capacities must be distinct increasing capacities "
+                                 "from the recipe's standard prefill catalog, including its maximum chunk")
         if self.benchmark_selection is not None:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
@@ -288,7 +304,7 @@ class Plan:
 
     @property
     def demand_pages(self) -> int:
-        return self.concurrency * (self.recipe.context // self.page_tokens)
+        return self.concurrency * -(-self.recipe.context // self.page_tokens)
 
     @property
     def page_tokens(self) -> int:
@@ -296,7 +312,7 @@ class Plan:
 
     @property
     def minimum_pages(self) -> int:
-        return self.concurrency * (MINIMUM_REQUEST_TOKENS // self.page_tokens)
+        return self.concurrency * -(-MINIMUM_REQUEST_TOKENS // self.page_tokens)
 
     @property
     def free_bytes(self) -> int:
@@ -352,7 +368,10 @@ class Plan:
                       "total_bytes": gpu.total_bytes} for gpu in self.gpus],
             "tensor_parallel": self.world_size, "max_concurrency": self.concurrency,
             "image_concurrency": self.image_concurrency,
-            "prefill_chunk": self.prefill_chunk, "roce_ring": self.roce_ring, "roce_chain": self.roce_chain, "context_parallel": self.context_parallel,
+            "prefill_chunk": self.prefill_chunk,
+            "prefill_graph_capacities": (None if self.prefill_graph_capacities is None
+                                         else list(self.prefill_graph_capacities)),
+            "roce_ring": self.roce_ring, "roce_chain": self.roce_chain, "context_parallel": self.context_parallel,
             "stream_overlap": self.stream_overlap,
             "mixed_prefill": self.mixed_prefill,
             "prompt_logprobs": self.prompt_logprobs,
@@ -375,6 +394,8 @@ class Plan:
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
                 "packed_verification": self.speculation.packed_verification,
                 "draft_prefix_selection": self.speculation.draft_prefix_selection,
+                **({} if self.speculation.draft_temperature is None else
+                   {"draft_temperature": self.speculation.draft_temperature}),
                 "draft_head_quantization": self.speculation.draft_head_quantization,
                 "markov_head_quantization": self.speculation.markov_head_quantization,
                 "vocabulary_parallel_sampling": self.speculation.vocabulary_parallel_sampling,
@@ -398,6 +419,7 @@ class Plan:
 
 def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concurrency: int, reserve_bytes: int,
         speculation: Speculation | None, prefill_chunk: int | None = None,
+        prefill_graph_capacities: tuple[int, ...] | None = None,
         context_parallel: bool = True, stream_overlap: bool = True, cache_states: int | None = None,
         mixed_prefill: bool = False, prompt_logprobs: bool = False,
         expert_scale_compression: str | None = None, roce_ring: bool = False,
@@ -459,7 +481,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
                     if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,
-                language_model_only=language_model_only)
+                language_model_only=language_model_only, prefill_graph_capacities=prefill_graph_capacities)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
     if cache_states is not None:
@@ -509,7 +531,8 @@ def host_shape_error(roce_ring: bool, roce_chain: bool, hosts: int | None) -> st
 
 def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selected: tuple[int, ...] | None,
          concurrency: int, reserve_bytes: int, speculation: Speculation | None,
-         prefill_chunk: int | None = None, context_parallel: bool = True, stream_overlap: bool = True,
+         prefill_chunk: int | None = None, prefill_graph_capacities: tuple[int, ...] | None = None,
+         context_parallel: bool = True, stream_overlap: bool = True,
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False,
@@ -570,8 +593,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
 
     def fitted(group, *, concurrency=concurrency, reserve_bytes=reserve_bytes, speculation=speculation):
         return fit(recipe, checkpoint, group, concurrency=concurrency, reserve_bytes=reserve_bytes,
-                   speculation=speculation, prefill_chunk=chunk, context_parallel=context_parallel,
-                   stream_overlap=stream_overlap, cache_states=cache_states,
+                   speculation=speculation, prefill_chunk=chunk, prefill_graph_capacities=prefill_graph_capacities,
+                   context_parallel=context_parallel, stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),

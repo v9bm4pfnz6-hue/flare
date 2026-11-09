@@ -23,6 +23,13 @@ GIB, MIB = 1 << 30, 1 << 20
 DRAFTING = Speculation(draft_tokens=3)
 
 
+def test_plan_records_explicit_draft_temperature_only():
+    assert "draft_temperature" not in derive().to_dict()["speculation"]
+    configured = derive(model=replace(SOLO, name="kimi31"),
+                        speculation=Speculation(draft_tokens=3, draft_temperature=.7))
+    assert configured.to_dict()["speculation"]["draft_temperature"] == .7
+
+
 def recipe(name, device_gib, ranks, *, speculation=None, mapped_gib=0, draft_gib=0):
     checkpoint = Checkpoint(name, f"lab/{name}", "ab12cd34" + "0" * 32, "DemoForCausalLM",
                             stored_bytes=(device_gib + mapped_gib) * GIB, device_bytes=device_gib * GIB,
@@ -87,6 +94,16 @@ def test_pages_take_all_remaining_supply():
     whole = derive(concurrency=1)
     assert whole.demand_pages == 4096 and whole.pages == 13574 and whole.guaranteed_tokens == 262144
     assert whole.supply_bytes - whole.page_bytes - whole.fixed_bytes < 2 * MIB
+
+
+def test_partial_context_pages_round_up_demand_and_minimum_capacity():
+    costs = MappingProxyType({1: replace(SOLO.ranks[1], page_tokens=96)})
+    plain_costs = MappingProxyType({1: replace(SOLO.plain_ranks[1], page_tokens=96)})
+    partial = replace(SOLO, context=SOLO.context + 1, ranks=costs, plain_ranks=plain_costs)
+    plan = derive(model=partial)
+    assert plan.page_tokens == 96
+    assert plan.demand_pages == 4 * 2731
+    assert plan.minimum_pages == 4 * 86
 
 
 def test_vocabulary_sampling_rejects_tp3_before_weight_loading():
@@ -820,3 +837,31 @@ def test_moe_decode_a16_geometry_and_rebuild_metadata(monkeypatch):
         replace(ordinary, gpus=tuple(gpu(i, 95) for i in range(4)), force_moe_decode_a16=True)
     with pytest.raises(UsageError, match="mixed-prefill"):
         replace(ordinary, mixed_prefill=True, force_moe_decode_a16=True)
+
+
+
+def test_kimi31_cli_prefill_graph_selection_round_trip(tmp_path):
+    from ignition.cli import _parser, preparation
+    from ignition.cli.config import Configuration
+    from ignition.recipes.kimi31.recipe import RECIPE
+
+    path = tmp_path / "flare.toml"
+    path.write_text("")
+    configuration = Configuration.load(path)
+    model = ResolvedModel(RECIPE, RECIPE.checkpoints[0])
+    args = _parser().parse_args(["export", "kimi-k3.1-pro", "--gpus", "0-8", "--no-mtp",
+        "--prefill-graph-capacities", "128,4096"])
+    devices = tuple(replace(gpu(i, 95), total_bytes=256 * GIB, free_bytes=255 * GIB) for i in range(9))
+    plan = preparation.derive(configuration, model, preparation.Host(devices, None), gpus=args.gpus,
+        concurrency=configuration.max_concurrency(model.checkpoint.alias, RECIPE.concurrency, args.max_concurrency),
+        speculation=preparation.speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
+        prefill_graph_capacities=args.prefill_graph_capacities)
+    assert args.prefill_graph_capacities == (128, 4096)
+    assert plan.prefill_graph_capacities == (128, 4096)
+    assert plan.to_dict()["prefill_graph_capacities"] == [128, 4096]
+    for capacities in ((), (128,), (4096, 128), (128, 512), (128, 384, 4096)):
+        with pytest.raises(UsageError, match="prefill-graph-capacities"):
+            replace(plan, prefill_graph_capacities=capacities)
+    with pytest.raises(UsageError, match="requires Kimi"):
+        planning.fit(SOLO, SOLO.checkpoints[0], (gpu(0, 95),), concurrency=4, reserve_bytes=0,
+                     speculation=DRAFTING, prefill_graph_capacities=(128, 4096))

@@ -24,6 +24,7 @@ from ignition.components.paged_attention import PreparedPagedAttention, Prepared
 from ignition.components.speculation import SpeculativeRngState
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
+from .config import padded_width
 from .pointwise import rms_norm_columns
 
 
@@ -74,7 +75,7 @@ def projection(source, weight, output, *, session, name, workspace):
 
 def local_heads(config, shard):
     d = config.draft
-    return d.heads // shard.world_size, d.kv_heads // shard.world_size
+    return padded_width(d.heads, shard.world_size), padded_width(d.kv_heads, shard.world_size)
 
 
 # b12x decodes 128-wide heads; the draft's 64-wide heads attend zero-padded, with queries scaled so the kernel's
@@ -101,7 +102,7 @@ class PreparedContext:
             if buffers[key].shape[0] < tokens:
                 raise ValueError("draft context storage must be allocated for the largest capacity first")
             return buffers[key][:tokens]
-        self.local = buffer("local", hidden // weights.shard.world_size)
+        self.local = buffer("local", padded_width(hidden, weights.shard.world_size, 64))
         self.projected = buffer("projected", hidden)
         self.normalized = buffer("normalized", hidden)
         self.project = projection(auxiliary, draft.projection, self.local, session=session, name=name + ".project",
@@ -170,14 +171,14 @@ class DraftScratch:
         def zeros(*shape):
             return torch.zeros(shape, dtype=torch.bfloat16, device=device)
         hidden = config.hidden
-        return cls(zeros(tokens, hidden // shard.world_size), zeros(tokens, hidden),
+        return cls(zeros(tokens, padded_width(hidden, shard.world_size, 64)), zeros(tokens, hidden),
             zeros(tokens, (heads + 2 * kv_heads) * d.head_dim), zeros(tokens, heads, PADDED_HEAD),
             zeros(tokens, kv_heads, d.head_dim), zeros(tokens, kv_heads, d.head_dim),
             zeros(tokens, heads, PADDED_HEAD), zeros(tokens, heads * d.head_dim), zeros(tokens, hidden),
             zeros(tokens, hidden),
             zeros(pages, 128, kv_heads, PADDED_HEAD), zeros(pages, 128, kv_heads, PADDED_HEAD),
-            MLPScratch.allocate(tokens, hidden, d.text["intermediate_size"] // shard.world_size, device),
-            zeros(tokens, hidden), zeros(tokens, config.vocabulary // shard.world_size),
+            MLPScratch.allocate(tokens, hidden, padded_width(d.text["intermediate_size"], shard.world_size, 32), device),
+            zeros(tokens, hidden), zeros(tokens, padded_width(config.vocabulary, shard.world_size, 64)),
             zeros(tokens, config.vocabulary))
 
     def rows(self, tokens, samples):
@@ -300,14 +301,15 @@ class PreparedMarkov:
         rows, device = tokens.numel(), tokens.device
         draft, vocabulary = weights.draft, weights.config.vocabulary
         self.embedding = torch.zeros((rows, weights.config.draft.markov_rank), dtype=torch.bfloat16, device=device)
-        self.local = torch.zeros((rows, vocabulary // weights.shard.world_size), dtype=torch.float32, device=device)
+        self.local = torch.zeros((rows, padded_width(vocabulary, weights.shard.world_size, 64)),
+                                 dtype=torch.float32, device=device)
         self.logits = torch.zeros((rows, vocabulary), dtype=torch.float32, device=device)
         self.embed = PreparedEmbedding(draft.markov_embedding, tokens, self.embedding, session=session,
                                        name=name + ".embed")
         self.projection = UnquantizedProjection(self.embedding, draft.markov_head, self.local, session=session,
                                                 name=name + ".head")
         # Gathering BF16 views transports the FP32 shards without conversion.
-        self.gather = PreparedAllGather(self.local.view(torch.bfloat16), self.logits.view(torch.bfloat16),
+        self.gather = PreparedChunkedAllGather(self.local.view(torch.bfloat16), self.logits.view(torch.bfloat16),
             runtime=runtime, coordinator=coordinator, session=session, name=name + ".gather")
 
     def __call__(self):
@@ -333,7 +335,8 @@ class SpeculativePreparation:
     """
 
     def __init__(self, weights, pool, requests, inputs, scratch, *, completion, frame, sequence, session, workspace,
-                 collectives, decoder_buffers, draft_tokens, context_runtime, page_tokens, markov_runtime):
+                 collectives, decoder_buffers, draft_tokens, context_runtime, page_tokens, markov_runtime,
+                 draft_temperature=1.):
         from ignition.components.kda_speculation import KDARecords
         from .decoder import PreparedDecoder
 
@@ -346,8 +349,9 @@ class SpeculativePreparation:
         self.collectives = dict(runtime=collectives["runtime"], vocabulary_runtime=collectives["vocabulary_runtime"],
                                 coordinator=coordinator)
         self.markov_runtime = markov_runtime
+        self.draft_temperature = draft_temperature
         kda_layers = {i: w["attention"] for i, w in enumerate(weights.layers) if weights.config.layers[i] == "kda"}
-        heads = weights.config.text["linear_attn_config"]["num_heads"] // weights.shard.world_size
+        heads = padded_width(weights.config.text["linear_attn_config"]["num_heads"], weights.shard.world_size)
         self.kda_records = KDARecords.allocate(kda_layers, requests.capacity + 1, heads, pool.backing.device)
 
         def decoder(weights, tables, scratch, metadata, pool, *, mode, **kwargs):

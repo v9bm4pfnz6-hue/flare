@@ -28,7 +28,7 @@ def test_default_mode_uses_manually_declared_model_card_sampling(recipe):
                               "presence_penalty": {"min": 0., "max": 2.}}
     elif recipe.name == "glm53":
         expected["ranges"] = {"temperature": {"min": .95, "max": 1.}, "top_p": {"min": .95, "max": 1.}}
-    elif recipe.name == "kimi3":
+    elif recipe.name in ("kimi3", "kimi31"):
         expected["ranges"] = {"top_p": {"min": .95, "max": 1.}}
     assert recipe.sampling_defaults.as_dict() == expected
 

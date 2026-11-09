@@ -18,6 +18,7 @@ from ignition.components.mlp import MLPScratch
 from ignition.components.speculation import SpeculativeRngState
 from ignition.preparation.scratch import GraphBufferPool
 from ignition.recipes.kimi3.decoder import PreparedDecoder
+from ignition.recipes.kimi3.config import padded_width
 from ignition.recipes.kimi3.dcp import write_records
 from ignition.recipes.kimi3.latent_dspark import YarnRotary
 from ignition.recipes.kimi3.pointwise import rms_norm_columns
@@ -62,11 +63,11 @@ class DraftScratch:
         h, vocab = config.hidden, config.vocabulary
         def zeros(columns, dtype=torch.bfloat16):
             return cursor.zeros((tokens, columns), dtype)
-        return cls(zeros(h//shard.world_size), zeros(h), zeros(h), zeros(h),
-            MLPScratch.allocate(tokens, h, config.draft.text["intermediate_size"]//shard.world_size, device, buffers=cursor),
-            zeros(h), zeros(vocab//shard.world_size), zeros(vocab), zeros(vocab, torch.float32),
+        return cls(zeros(padded_width(h, shard.world_size, 64)), zeros(h), zeros(h), zeros(h),
+            MLPScratch.allocate(tokens, h, padded_width(config.draft.text["intermediate_size"], shard.world_size, 32), device, buffers=cursor),
+            zeros(h), zeros(padded_width(vocab, shard.world_size, 64)), zeros(vocab), zeros(vocab, torch.float32),
             dict(coefficients=zeros(4*h//16), before=zeros(h), after=zeros(h),
-                 local_coefficients=zeros(4*h//16//shard.world_size)), {}, block)
+                 local_coefficients=zeros(padded_width(4*h//16, shard.world_size, 8))), {}, block)
 
     def rows(self, tokens, samples):
         if samples != tokens or not 0 < tokens <= self.embedding.shape[0] or tokens % self.block_size:
@@ -98,10 +99,10 @@ class PreparedContext:
             self.compact_offsets = torch.arange(rows, device=auxiliary.device)
             self.compact_positions = cursor.full((rows,), -1, metadata.positions.dtype)
         reference_rows = metadata.positions.numel() if self.compact_positions is not None else None
-        self.local = cursor.zeros((rows, h//shard.world_size), torch.bfloat16)
+        self.local = cursor.zeros((rows, padded_width(h, shard.world_size, 64)), torch.bfloat16)
         self.projected = cursor.zeros((rows, h), torch.bfloat16)
         self.normalized = cursor.zeros((rows, h), torch.bfloat16)
-        local_width = (c.layers*576//shard.world_size + 7)//8*8
+        local_width = padded_width(c.layers * 576, shard.world_size, 8)
         self.kv_local = cursor.zeros((rows, local_width), torch.bfloat16)
         self.kv = cursor.zeros((rows, local_width*shard.world_size), torch.bfloat16)
         self.latent = cursor.zeros((rows, 576), torch.bfloat16)
@@ -161,7 +162,9 @@ class DraftAttention:
         self.metadata, self.weights = metadata, weights.attention
         self.window, self.world, self.eps = config.window, shard.world_size, config.text["rms_norm_eps"]
         n, h = source.shape
-        heads, width = config.heads//shard.world_size, (2112//shard.world_size + 7)//8*8
+        heads = padded_width(config.heads, shard.world_size)
+        self.local_q, self.local_kv = padded_width(1536, shard.world_size), padded_width(576, shard.world_size)
+        width = -(-(self.local_q + self.local_kv) // 8) * 8
         cursor = buffers.fork()
         def storage(key, shape, dtype=torch.bfloat16):
             if key not in scratch.attention:
@@ -173,7 +176,7 @@ class DraftAttention:
             return value[:shape[0]]
         self.local = storage("local", (n, width))
         self.gathered = storage("gathered", (n, width*shard.world_size))
-        self.q_latent = storage("q_latent", (n, 1536))
+        self.q_latent = storage("q_latent", (n, shard.world_size * self.local_q))
         self.q_norm = storage("q_norm", (n, 1536))
         self.latent = storage("latent", (n, 576))
         self.query = storage("query", (n, heads, 192))
@@ -214,10 +217,10 @@ class DraftAttention:
     def __call__(self, source):
         m, w = self.metadata, self.weights
         gathered = self.gather(self.project(source)).view(source.shape[0], self.world, -1)
-        q = 1536//self.world
+        q, kv = self.local_q, self.local_kv
         self.q_latent.view(-1, self.world, q).copy_(gathered[:, :, :q])
-        self.latent.view(-1, self.world, 576//self.world).copy_(gathered[:, :, q:q+576//self.world])
-        rms_norm_columns(self.q_latent, w["query_norm"], self.q_norm, self.eps)
+        self.latent.view(-1, self.world, kv).copy_(gathered[:, :, q:q + kv])
+        rms_norm_columns(self.q_latent[:, :1536], w["query_norm"], self.q_norm, self.eps)
         rms_norm_columns(self.latent[:, :512], w["kv_norm"], self.latent[:, :512], self.eps)
         self.query_project(self.q_norm)
         self.rotary.apply(self.query, m.positions)
@@ -234,7 +237,8 @@ class DraftAttention:
 class SpeculativePreparation:
     def __init__(self, weights, pool, requests, inputs, scratch, *, completion, frame, sequence, session, workspace,
                  collectives, decoder_buffers, draft_tokens, context_runtime, page_tokens,
-                 latent_runtime, context_latent_runtime, convolution_runtime, context_buffers=None):
+                 latent_runtime, context_latent_runtime, convolution_runtime, context_buffers=None,
+                 draft_temperature=1.):
         self.page_tokens = page_tokens
         self.weights, self.tables, self.pool = weights, None, pool
         self.requests, self.inputs, self.scratch = requests, inputs, scratch
@@ -243,8 +247,9 @@ class SpeculativePreparation:
         coordinator = collectives["coordinator"]
         self.collectives = {key: collectives[key] for key in ("runtime", "vocabulary_runtime", "coordinator")}
         self.markov_runtime = None
+        self.draft_temperature = draft_temperature
         layers = {i: w["attention"] for i, w in enumerate(weights.layers) if weights.config.layers[i] == "kda"}
-        heads = weights.config.text["linear_attn_config"]["num_heads"]//weights.shard.world_size
+        heads = padded_width(weights.config.text["linear_attn_config"]["num_heads"], weights.shard.world_size)
         self.kda_records = KDARecords.allocate(layers, requests.capacity+1, heads, pool.backing.device)
         def decoder(weights, tables, scratch, metadata, pool, *, mode, **kwargs):
             return PreparedDecoder(weights, scratch, metadata, pool, mode=mode, buffers=decoder_buffers,

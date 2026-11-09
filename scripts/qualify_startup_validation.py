@@ -129,14 +129,14 @@ def fixture(snapshot):
                 selected.update(("sample_enabled", "page_tables"))
             fields = tuple(b["buffer_name"] for b in bindings if b["buffer_name"] in selected)
             signatures[name] = GraphSignature(kind, batch, tokens, fields)
-            graphs.append({"name": name, "kind": kind,
+            graphs.append({"name": name, "kind": kind, "tuned_bindings": [],
                 "sampling_mode": "general", "handle": len(graphs) + 1, "estimated_duration_ns": 1000,
                 "batch_capacity": batch, "token_capacity": tokens,
                 "prefill_capacity": 0, "confidence_width": 0,
                 "input_bindings": [deepcopy(b) for b in bindings if b["buffer_name"] in
                                    (*signatures[name].inputs, "frame_index", "submission_sequence")]})
     manifest = {"abi_version": ABI_VERSION, "completion_token_capacity": 8, "context": 1, "device": 0, "max_active": 4,
-        "input_frame_bytes": host, "buffers": buffers, "graphs": graphs}
+        "input_frame_bytes": host, "buffers": buffers, "graphs": graphs, "tuning_graphs": []}
     from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
     from ignition.recipes.qwen38.recipe import RECIPE
 
@@ -169,7 +169,8 @@ def cases(snapshot):
     def buffer(m, name):
         return next(item for item in m["buffers"] if item["name"] == name)
 
-    add("abi-version", "unsupported execution ABI version", lambda m, c: m.update(abi_version=2))
+    add("abi-version", "assets must contain verified frontend descriptors", lambda m, c:
+        (m.update(abi_version=2), c.pop("assets")))
     add("null-context", "nonnull context", lambda m, c: m.update(context=0))
     add("overlapping-buffers", "overlap", lambda m, c:
         buffer(m, "row_generations").update(address=buffer(m, "row_slot_ids")["address"]))
@@ -211,7 +212,9 @@ def cases(snapshot):
 
     add("write-only-pending-consumer", "pending token requires a declared device-state read", pending_consumer)
     add("invalid-model-context", "invalid prepared model configuration", lambda m, c:
-        c.update(max_sequence_tokens=262145))
+        c.update(max_sequence_tokens=262145, page_tokens=63))
+    add("partial-page-model-context", "assets must contain verified frontend descriptors", lambda m, c:
+        (c.update(max_sequence_tokens=262145), c.pop("assets")))
     add("valid-shapes-reach-asset-validation", "assets must contain verified frontend descriptors",
         lambda m, c: c.pop("assets"))
     add("asset-checksum", "frontend asset SHA256 mismatch", lambda m, c:
@@ -229,6 +232,12 @@ def child(path):
     import flare_heliopause
 
     case = json.loads(path.read_text())
+    directory = TemporaryDirectory(prefix="flare-startup-assets-")
+    for name, asset in case["config"].get("assets", {}).items():
+        if "text" in asset:
+            source = Path(directory.name) / name
+            source.write_text(asset.pop("text"))
+            asset["path"] = str(source)
 
     class Owner:
         pass

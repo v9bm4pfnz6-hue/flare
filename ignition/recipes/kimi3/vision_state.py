@@ -15,6 +15,7 @@ class PreparedVisionGeneration:
         self.encoder, self.state = encoder, state
         self.compilation_variant = encoder.compilation_variant
         self.feature_columns = torch.arange(*feature_range, device=state.arena.device)
+        self.valid_columns = max(0, min(feature_range[1], 7168) - feature_range[0])
         shape = (encoder.scratch.patches.shape[0] // 4, state.arena.shape[2])
         self.features = (torch.empty(shape, dtype=state.arena.dtype, device=state.arena.device) if buffers is None
                          else buffers.zeros(shape, state.arena.dtype))
@@ -57,5 +58,7 @@ class PreparedVisionGeneration:
         e.num_features.copy_(torch.where(valid, features, 0))
         output = e()
         self.errors.copy_(self.errors | (~((~feature_live[:, None]) | torch.isfinite(output)).all()).int() * 64)
-        self.features.copy_(output.index_select(1, self.feature_columns))
+        self.features.copy_(output.index_select(1, self.feature_columns.clamp(max=output.shape[1] - 1)))
+        if self.valid_columns < self.features.shape[1]:
+            self.features[:, self.valid_columns:].zero_()
         self.publish(self.features, e.num_features, self.errors)

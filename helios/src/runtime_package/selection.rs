@@ -27,6 +27,8 @@ pub struct LoadOptions {
     /// Disk workers per table: four on Windows, one elsewhere. Share 128 slots and 8 MiB staging.
     pub embedding_table_workers: Option<usize>,
     pub max_concurrency: Option<usize>,
+    /// Dedicated prefill capacities to load; the prepared maximum remains required.
+    pub prefill_graph_capacities: Option<Vec<usize>>,
     pub mtp_draft_tokens: Option<usize>,
     pub history_drafts: Option<bool>,
     /// Select one exact packed verification capacity per batch before proposal sampling.
@@ -67,6 +69,17 @@ impl LoadOptions {
     }
 
     pub(super) fn select(&self, packages: &mut [Package], config: &mut Value) -> Result<usize> {
+        let prefill_capacities = self.prefill_graph_capacities.as_ref().map(|capacities| {
+            let selected: BTreeSet<u64> = capacities.iter().map(|&capacity| capacity as u64).collect();
+            let maximum = config.get("prefill_chunk_size").and_then(Value::as_u64);
+            if selected.is_empty() || selected.len() != capacities.len()
+                || selected.iter().any(|capacity| *capacity == 0 || !capacity.is_multiple_of(64))
+                || selected.last().copied() != maximum
+            {
+                return Err(invalid("prefill graph capacities must be distinct positive multiples of 64 and include the prepared maximum chunk size"));
+            }
+            Ok(selected)
+        }).transpose()?;
         if self.mtp_verification_token_budget.is_some()
             && self.mtp_max_verification_token_budget.is_some()
         {
@@ -277,6 +290,26 @@ impl LoadOptions {
             execution.graphs.retain(|graph| graph.draft_tokens.is_none_or(|depth|
                 depths[&(graph.kind.clone(), graph.batch_capacity, graph.token_capacity,
                     graph.packed_token_capacity, graph.prefill_capacity, graph.sampling_mode.clone())] == depth));
+            if let Some(capacities) = &prefill_capacities {
+                let families: BTreeSet<_> = execution.graphs.iter()
+                    .filter(|graph| matches!(graph.kind.as_str(), "prefill" | "scored_prefill"))
+                    .map(|graph| (graph.kind.clone(), graph.batch_capacity, graph.sampling_mode.clone())).collect();
+                if !families.iter().any(|(kind, _, _)| kind == "prefill") {
+                    return Err(invalid("prefill graph capacities require dedicated prefill graphs"));
+                }
+                for (kind, batch, sampling) in families {
+                    for &capacity in capacities {
+                        if !execution.graphs.iter().any(|graph| graph.kind == kind
+                            && graph.batch_capacity == batch && graph.sampling_mode == sampling
+                            && graph.token_capacity == capacity)
+                        {
+                            return Err(invalid(format!("rank {rank} lacks {kind} graph for prefill capacity {capacity}, batch {batch}, sampling mode {sampling:?}")));
+                        }
+                    }
+                }
+                execution.graphs.retain(|graph| !matches!(graph.kind.as_str(), "prefill" | "scored_prefill")
+                    || capacities.contains(&graph.token_capacity));
+            }
             for batch in BATCH_CAPACITIES.into_iter().filter(|batch| *batch <= active.next_power_of_two()) {
                 for kind in ["init", "restore", "snapshot", "resume", if enabled { "speculative" } else { "decode" }] {
                     if !execution.graphs.iter().any(|g| g.kind == kind && g.batch_capacity == batch as u64
@@ -551,6 +584,108 @@ mod tests {
 
     fn config() -> Value {
         serde_json::json!({"speculative_token_capacity": 24, "speculative_widths": [1,2,3,4,5,6], "speculative_fixed_width": null})
+    }
+
+    fn prefill_package(scored: bool) -> Package {
+        let mut package = package();
+        for enabled in [false, true] {
+            for kind in if scored { vec!["prefill", "scored_prefill"] } else { vec!["prefill"] } {
+                for capacity in [128, 512, 4096] {
+                    let name = format!("{kind}{capacity}-{enabled}");
+                    let id = package.functions.len();
+                    package.execution.as_mut().unwrap().graphs.push(wire::ExecutionGraph {
+                        name: name.clone(), kind: kind.into(), sampling_mode: "general".into(),
+                        batch_capacity: 1, token_capacity: capacity, speculation_enabled: Some(enabled),
+                        ..Default::default()
+                    });
+                    package.graphs.push(Graph { name: name.clone(), flags: 0, resource: name.clone(),
+                        node_count: 1, edge_count: 0, functions: vec![id] });
+                    package.functions.push(Function { id, module: name.clone(), symbol: "kernel".into(),
+                        parameter_sizes: vec![], attributes: vec![] });
+                    package.modules.push(Module { name: name.clone(), file: name, globals: vec![] });
+                }
+            }
+        }
+        let name = "vision256".to_string();
+        package.execution.as_mut().unwrap().graphs.push(wire::ExecutionGraph {
+            name: name.clone(), kind: "vision".into(), sampling_mode: "general".into(),
+            batch_capacity: 1, token_capacity: 256, ..Default::default()
+        });
+        package.graphs.push(Graph { name, flags: 0, resource: "vision".into(), node_count: 1,
+            edge_count: 0, functions: vec![0] });
+        package
+    }
+
+    fn prefill_config() -> Value {
+        let mut config = config();
+        config["prefill_chunk_size"] = 4096.into();
+        config
+    }
+
+    #[test]
+    fn explicit_prefill_capacities_preserve_families_storage_and_the_prepared_chunk() {
+        for drafts in [0, 5] {
+            let mut baseline = [prefill_package(true)];
+            let mut selected = [prefill_package(true)];
+            let storage = format!("{:?}", selected[0].allocations);
+            let mut baseline_config = prefill_config();
+            let mut selected_config = prefill_config();
+            LoadOptions { mtp_draft_tokens: Some(drafts), ..Default::default() }
+                .select(&mut baseline, &mut baseline_config).unwrap();
+            LoadOptions { mtp_draft_tokens: Some(drafts), prefill_graph_capacities: Some(vec![128, 4096]),
+                ..Default::default() }.select(&mut selected, &mut selected_config).unwrap();
+            assert_eq!(selected_config, baseline_config);
+            assert_eq!(format!("{:?}", selected[0].allocations), storage);
+            let execution = selected[0].execution.as_ref().unwrap();
+            for kind in ["prefill", "scored_prefill"] {
+                let graphs: Vec<_> = execution.graphs.iter().filter(|graph| graph.kind == kind).collect();
+                assert_eq!(graphs.iter().map(|graph| graph.token_capacity).collect::<Vec<_>>(), [128, 4096]);
+                assert!(graphs.iter().all(|graph| graph.speculation_enabled == Some(drafts > 0)));
+                assert!(!selected[0].functions.iter().any(|function| function.module.starts_with(&format!("{kind}512-"))));
+            }
+            let others = |package: &Package| package.execution.as_ref().unwrap().graphs.iter()
+                .filter(|graph| !matches!(graph.kind.as_str(), "prefill" | "scored_prefill"))
+                .cloned().collect::<Vec<_>>();
+            assert_eq!(others(&selected[0]), others(&baseline[0]));
+            assert!(selected[0].graphs.iter().any(|graph| graph.name == "vision256"));
+            assert_eq!(selected[0].allocations.iter().map(|allocation| allocation.name.as_str()).collect::<Vec<_>>(),
+                       ["weights", "mtp-weights", "scratch"]);
+        }
+    }
+
+    #[test]
+    fn omitted_prefill_capacities_retain_all_captured_capacities() {
+        let mut packages = [prefill_package(true)];
+        LoadOptions { mtp_draft_tokens: Some(0), ..Default::default() }
+            .select(&mut packages, &mut prefill_config()).unwrap();
+        for kind in ["prefill", "scored_prefill"] {
+            assert_eq!(packages[0].execution.as_ref().unwrap().graphs.iter().filter(|graph| graph.kind == kind)
+                .map(|graph| graph.token_capacity).collect::<Vec<_>>(), [128, 512, 4096]);
+        }
+    }
+
+    #[test]
+    fn invalid_or_uncaptured_prefill_capacities_fail_before_resource_loading() {
+        for capacities in [vec![], vec![0, 4096], vec![129, 4096], vec![128, 128, 4096],
+                           vec![128], vec![128, 8192], vec![64, 4096]] {
+            assert!(LoadOptions { mtp_draft_tokens: Some(0), prefill_graph_capacities: Some(capacities),
+                ..Default::default() }.select(&mut [prefill_package(true)], &mut prefill_config()).is_err());
+        }
+        assert!(LoadOptions { prefill_graph_capacities: Some(vec![128, 4096]), ..Default::default() }
+            .select(&mut [package()], &mut prefill_config()).unwrap_err().to_string().contains("dedicated prefill"));
+    }
+
+    #[test]
+    fn requested_prefill_capacities_must_exist_in_scored_and_peer_catalogs() {
+        for missing_rank in [0, 1] {
+            let mut packages = [prefill_package(true), prefill_package(true)];
+            let name = "scored_prefill4096-false";
+            packages[missing_rank].execution.as_mut().unwrap().graphs.retain(|graph| graph.name != name);
+            packages[missing_rank].graphs.retain(|graph| graph.name != name);
+            let error = LoadOptions { mtp_draft_tokens: Some(0), prefill_graph_capacities: Some(vec![128, 4096]),
+                ..Default::default() }.select(&mut packages, &mut prefill_config()).unwrap_err();
+            assert!(error.to_string().contains(&format!("rank {missing_rank} lacks scored_prefill graph for prefill capacity 4096")));
+        }
     }
 
     #[test]

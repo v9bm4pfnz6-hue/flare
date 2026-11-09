@@ -479,14 +479,25 @@ def _variant_compilers(selections):
     return compilers
 
 
-def _balance_compilations(counts, workers):
-    """Spread forwards missing from one host's cache over its ranks' compilers.
+def _balance_compilations(counts, workers, device_names=None):
+    """Spread missing forwards among compilers with identical CUDA device names.
 
     Rank `i` must compile `counts[i]` forwards with `workers[i]` workers; a rank without workers,
     whose GPU lacks room for one, lends all of them. Returns, per rank, the (owner, index)
     forwards it compiles: each rank keeps its own until lending one finishes sooner elsewhere.
-    Every rank derives the same assignment.
+    Every rank derives the same assignment. Torch compiled artifacts cannot cross device-name
+    boundaries, so heterogeneous ranks balance their work in independent groups.
     """
+    if device_names is not None:
+        if len(device_names) != len(counts) or len(workers) != len(counts):
+            raise ValueError("compiler counts, workers, and device names must have equal lengths")
+        assigned = [[] for _ in counts]
+        for name in dict.fromkeys(device_names):
+            ranks = [rank for rank, device_name in enumerate(device_names) if device_name == name]
+            balanced = _balance_compilations([counts[rank] for rank in ranks], [workers[rank] for rank in ranks])
+            for borrower, jobs in zip(ranks, balanced, strict=True):
+                assigned[borrower].extend((ranks[owner], index) for owner, index in jobs)
+        return assigned
     if not any(workers):
         raise MemoryError("no rank on this host has room for a forward compiler")
     assigned = [[(owner, index) for index in range(count)] for owner, count in enumerate(counts)]
@@ -556,6 +567,7 @@ class ForwardCache:
         self.lock_gpu_clocks = lock_gpu_clocks
         self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
         properties = torch.cuda.get_device_properties(device)
+        self.device_name = properties.name
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
         key = hashlib.sha256(pickle.dumps((namespace, compilation_options_identity(options), torch_key(),
             properties.name, properties.major, properties.minor, properties.multi_processor_count)))
@@ -741,13 +753,12 @@ class ForwardCache:
                        before_run):
         """Compile the catalog for a rank group, then bind and warm it on every rank.
 
-        Compiled forwards serve every rank, so the catalog compiles once: each forward variant a
-        rank selects through `compilation_variant` compiles on a rank that selects it, from that
-        rank's own forward, unless an idle rank on the same host borrows it and compiles it from
-        the owner's traced forward metadata. Compiler pools are budgeted for the host's ranks.
-        Ranks on one host share its cache directory; a rank on another host receives the
-        artifacts it lacks from the ranks that compiled them. Every rank then binds the same
-        artifacts.
+        Each forward variant a rank selects through `compilation_variant` compiles once per CUDA
+        device name, on a rank that selects it, from that rank's own forward. An idle rank on the
+        same host may borrow it only when its device has the same Torch compatibility name.
+        Compiler pools are budgeted for the host's ranks. Ranks on one host share its cache
+        directory; a rank on another host receives the artifacts it lacks from the ranks that
+        compiled them. Every rank binds an artifact compiled for its own device name.
         """
         import torch.distributed as dist
         from ignition.progress import phase
@@ -757,10 +768,16 @@ class ForwardCache:
         group, ranks = coordinator.group, coordinator.ranks
         share = ranks.index(dist.get_rank())
         selections = [None] * len(ranks)
-        dist.all_gather_object(selections, {name: getattr(forward, "compilation_variant", "shared")
+        dist.all_gather_object(selections, {name: (getattr(forward, "compilation_variant", "shared"), self.device_name)
                                             for name, forward in functions.items()}, group=group)
         if any(chosen.keys() != selections[0].keys() for chosen in selections):
             raise RuntimeError("ranks prepared different forward catalogs")
+        device_names = []
+        for chosen in selections:
+            names = {device_name for _, device_name in chosen.values()}
+            if len(names) != 1:
+                raise RuntimeError("a rank prepared forwards for different CUDA device names")
+            device_names.append(names.pop())
         compilers = _variant_compilers(selections)
         work = [(name, variant, functions[name]) for (name, variant), compiler in compilers.items() if compiler == share]
         selected, outcome, error, compiler, paths, lent, sent = {}, (None, None), None, None, {}, set(), []
@@ -796,7 +813,8 @@ class ForwardCache:
             demand = [None] * len(ranks)
             dist.all_gather_object(demand, (len(missing), 0 if compiler is None else compiler.workers), group=group)
             if not coordinator.spans_hosts and any(workers for _, workers in demand):
-                assigned = _balance_compilations([count for count, _ in demand], [workers for _, workers in demand])
+                assigned = _balance_compilations([count for count, _ in demand],
+                                                [workers for _, workers in demand], device_names)
                 loans = [(borrower, missing[index]) for borrower, forwards in enumerate(assigned)
                          for owner, index in forwards if owner == share and borrower != share]
                 lent = {work[index][:2] for _, index in loans}
@@ -887,7 +905,7 @@ class ForwardCache:
                 for name, forward in functions.items():
                     if name in selected:
                         continue
-                    path, compiled = paths[name, getattr(forward, "compilation_variant", "shared")]
+                    path, compiled = paths[name, (getattr(forward, "compilation_variant", "shared"), self.device_name)]
                     with _guard_code_cache(self.root / 'guards'):
                         selected[name] = self._load(forward, Path(path), required=True,
                             before_run=None if before_run is None else lambda name=name: before_run(name))
@@ -926,7 +944,7 @@ class ForwardCache:
         try:
             for name, bound in selected.items():
                 selections.freeze(bound)
-                variant = getattr(functions[name], 'compilation_variant', 'shared')
+                variant = getattr(functions[name], 'compilation_variant', 'shared'), self.device_name
                 if compilers[name, variant] == share:
                     path, _ = paths[name, variant]
                     bound.artifact.save_compiled_function(path)

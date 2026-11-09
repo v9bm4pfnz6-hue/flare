@@ -33,6 +33,20 @@ def test_flash_default_mtp_and_explicit_dflash_preserve_requested_capacities():
     assert selected("--speculative-method", "dflash2", "--mtp-draft-tokens", "0").widths == (1,)
 
 
+def test_draft_temperature_is_an_explicit_proposal_only_preparation_choice():
+    assert selected().draft_temperature is None
+    assert selected("--draft-temperature", "0.7", model="kimi-k3.1-pro").draft_temperature == .7
+    for temperature in ("0", "-1", "nan", "inf"):
+        with pytest.raises(ValueError, match="finite and positive"):
+            selected("--draft-temperature", temperature, model="kimi-k3.1-pro")
+    with pytest.raises(UsageError, match="requires Kimi"):
+        selected("--draft-temperature", "0.7")
+    with pytest.raises(UsageError, match="cannot accompany"):
+        selected("--no-mtp", "--draft-temperature", "0.7", model="kimi-k3.1-pro")
+    with pytest.raises(UsageError, match="positive learned draft depth"):
+        selected("--mtp-draft-tokens", "0", "--draft-temperature", "0.7", model="kimi-k3.1-pro")
+
+
 def test_method_configuration_and_explicit_flags(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('[defaults]\nspeculative_method = "dflash2"\n')

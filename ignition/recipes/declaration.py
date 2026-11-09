@@ -120,8 +120,11 @@ class Speculation:
     markov_head_quantization: str | None = None
     vocabulary_parallel_sampling: bool = False
     method: str | None = None
+    draft_temperature: float | None = None
 
     def __post_init__(self):
+        if self.draft_temperature is not None and not 0 < self.draft_temperature < float("inf"):
+            raise ValueError("draft temperature must be finite and positive")
         if self.method not in (None, "mtp", "dflash2"):
             raise ValueError("speculative method must be omitted, mtp or dflash2")
         if self.vocabulary_parallel_sampling and self.draft_tokens < 1:

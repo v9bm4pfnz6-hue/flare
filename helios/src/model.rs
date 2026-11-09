@@ -263,11 +263,18 @@ impl ModelConfig {
         } else {
             0
         };
-        self.limits.max_sequence_tokens = self.prepared_sequence_tokens.min(
-            (self.limits.pages as usize)
-                .saturating_sub(draft_pages)
-                .saturating_mul(capabilities.page_tokens),
-        );
+        let available_tokens = (self.limits.pages as usize)
+            .saturating_sub(draft_pages)
+            .saturating_mul(capabilities.page_tokens);
+        self.limits.max_sequence_tokens = self.limits.max_sequence_tokens.min(available_tokens);
+        self.prepared_sequence_tokens = if capabilities.page_tokens == 0 {
+            0
+        } else {
+            self.limits
+                .max_sequence_tokens
+                .checked_next_multiple_of(capabilities.page_tokens)
+                .unwrap_or(usize::MAX)
+        };
     }
 
     pub fn has_learned_drafts(&self) -> bool {

@@ -96,4 +96,4 @@ class DFlash2Config:
     def validate_shard(self, shard):
         for extent, alignment in ((self.heads, 1), (self.text["hidden_size"], 64),
                 (self.text["intermediate_size"], 32), (self.text["q_lora_rank"], 1), (576, 1)):
-            shard.partition(extent, alignment=alignment)
+            shard.padded_partition(extent, alignment=alignment)

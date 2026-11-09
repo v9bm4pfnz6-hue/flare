@@ -82,8 +82,9 @@ def _assert_view(view, expected):
 def test_stages_reuse_identical_views_and_preserve_partial_geometry(construct, rows, world):
     op, cache = construct(rows, world)
     by_count = {}
-    for begin, end, selector, merge, quantized, gather, attention, combine, lse in op.stages:
+    for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired in op.stages:
         count = end - begin
+        assert paired is None
         views = (selector.pages, selector.lengths, selector.output, selector.scores,
                  None if merge is None else merge.output, attention.pages, attention.lengths, attention.starts)
         expected = (op.pages[:count], op.lengths[:count], op.local[:count], op.scores[:count],

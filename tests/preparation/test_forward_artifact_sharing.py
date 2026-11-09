@@ -81,6 +81,15 @@ def test_ranks_lend_missing_compilations_until_lending_finishes_no_sooner():
     assert max(map(len, assigned)) == 7
 
 
+def test_lending_never_crosses_torch_gpu_compatibility_names():
+    from ignition.preparation.aot import _balance_compilations
+
+    assigned = _balance_compilations([6, 0, 3, 0], [1, 1, 0, 1], ["max-q", "max-q", "full", "full"])
+    assert sorted(job for jobs in assigned[:2] for job in jobs) == [(0, index) for index in range(6)]
+    assert assigned[2] == []
+    assert sorted(assigned[3]) == [(2, index) for index in range(3)]
+
+
 class _Forward:
     def __init__(self, variant):
         self.compilation_variant = variant
@@ -110,6 +119,7 @@ def _replace_gpu_preparation():
             pass
 
     inductor_tuning.InductorSelections = Selections
+    torch.cuda.get_device_properties = lambda device: SimpleNamespace(name="shared-test-gpu")
     torch.cuda.current_stream = lambda device: SimpleNamespace(synchronize=lambda: None)
 
 
@@ -161,6 +171,7 @@ def _lending_rank(rank, world, store, root, outcome):
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
         cache = aot.ForwardCache.__new__(aot.ForwardCache)
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
+        cache.device_name = "shared-test-gpu"
         cache.compile_workers = None
         cache.lock_gpu_clocks = False
         variant = "sample" if rank == 0 else "consume"
@@ -226,12 +237,14 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
         cache = aot.ForwardCache.__new__(aot.ForwardCache)
         cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
+        cache.device_name = "shared-test-gpu"
         cache.compile_workers = None
         cache.lock_gpu_clocks = False
         functions = {name: _Forward("shared") for name in "abcd"}
         signatures = {name: name for name in functions}
         for name, forward in functions.items():
-            cache._path(forward, name=f"{name}.shared", signature=name).write_text("cached")
+            variant = "shared", cache.device_name
+            cache._path(forward, name=f"{name}.{variant}", signature=name).write_text("cached")
         dist.barrier()
         coordinator = SimpleNamespace(group=dist.group.WORLD, ranks=tuple(range(world)), spans_hosts=False,
             local_ranks=world, barrier=lambda key, ranks: dist.monitored_barrier(group=dist.group.WORLD))

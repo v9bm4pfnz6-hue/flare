@@ -10,7 +10,7 @@ from ignition.components.paged_state import PagedStateStorage
 from ignition.components.recurrent import DeltaState
 from ignition.components.state import StateLayout
 
-from .config import PAGE_TOKENS, LatentDSparkConfig
+from .config import PAGE_TOKENS, LatentDSparkConfig, padded_width
 from .dcp import RECORD_BYTES
 from ignition.recipes.kimi31.dflash_config import DFlash2Config
 
@@ -37,7 +37,7 @@ def continuation_layout(config, world_size, *, speculative_tokens=0):
     """One continuation row; speculation widens each KDA convolution history by the verified drafts, DSpark
     adds every draft layer's key and value window, so restored
     continuations resume drafting. A copy of each page region holds a snapshot's partial page."""
-    heads = config.text["linear_attn_config"]["num_heads"] // world_size
+    heads = padded_width(config.text["linear_attn_config"]["num_heads"], world_size)
     regions = []
     for index, kind in enumerate(config.layers):
         if kind == "kda":
@@ -49,10 +49,10 @@ def continuation_layout(config, world_size, *, speculative_tokens=0):
             regions.append((f"draft{layer}.latent", (config.draft.window, RECORD_BYTES), torch.float8_e4m3fn))
     elif speculative_tokens and config.draft is not None and not isinstance(config.draft, LatentDSparkConfig):
         d = config.draft
+        kv_heads = padded_width(d.kv_heads, world_size)
         for layer in range(d.layers):
             for kind in ("key", "value"):
-                regions.append((f"draft{layer}.{kind}", (d.window, d.kv_heads // world_size, d.head_dim),
-                                torch.bfloat16))
+                regions.append((f"draft{layer}.{kind}", (d.window, kv_heads, d.head_dim), torch.bfloat16))
     regions.extend((("last_hidden", (config.hidden,), torch.bfloat16), ("consumed_tokens", (1,), torch.int64)))
     return StateLayout.from_specs(regions)
 

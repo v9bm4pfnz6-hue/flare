@@ -35,7 +35,7 @@ def configuration():
     return target, raw
 
 
-@pytest.mark.parametrize("world", [8,16])
+@pytest.mark.parametrize("world", [8,9,16])
 def test_sharded_draft_preserves_target_pages(world):
     target, raw = configuration()
     draft = DSparkConfig.from_dict(raw, target.text)

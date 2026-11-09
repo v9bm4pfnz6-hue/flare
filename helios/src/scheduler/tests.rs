@@ -483,6 +483,33 @@ fn prefill_uses_only_declared_capacities() {
 }
 
 #[test]
+fn sparse_prefill_catalog_preserves_full_chunks_and_allocates_only_live_pages() {
+    for (prompt, capacity, pages) in [(17, 128, 1), (300, 4096, 5), (4096, 4096, 64)] {
+        let mut scheduler = RequestScheduler::new([9; 32], SchedulerLimits {
+            request_slots: 1, max_active: 1, max_sequence_tokens: 8192,
+            prefill_chunk_size: 4096, pages: 128, snapshots: 2,
+        }, SchedulerCapabilities {
+            completion_token_capacity: 16, vocabulary: 248320, page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(), draft_pages_per_request: 0,
+            completion_inputs: vec![], speculative_allocations: vec![], state_rows_per_request: None,
+        }).unwrap();
+        let graphs: Vec<_> = duration_graphs(1).into_iter().filter(|graph|
+            graph.kind != GraphKind::Prefill || [128, 4096].contains(&graph.token_capacity)).collect();
+        scheduler.measured_graph_durations(&graphs).unwrap();
+        scheduler.prefill_graphs(&[128, 4096]).unwrap();
+        let handle = scheduler.admit(spec(prompt, 3)).unwrap();
+        init(&mut scheduler, 1);
+        let step = scheduler.plan().unwrap();
+        assert_eq!((step.kind, step.token_capacity, step.lanes[0].tokens),
+                   (GraphKind::Prefill, capacity, prompt));
+        scheduler.commit(&step, Fence(2)).unwrap();
+        assert_eq!(scheduler.request(handle).unwrap().pages().count(), pages);
+        // Admission also reserves pages for the three requested output tokens.
+        assert_eq!(scheduler.free_page_count(), 128 - (prompt + 3).div_ceil(64));
+    }
+}
+
+#[test]
 fn configured_prefill_chunks_and_tails_preserve_alignment_and_live_page_extents() {
     for (chunk_size, tail, tail_capacity) in
         [(4096, 17, 128), (3072, 2050, 2560), (8192, 513, 1024)]

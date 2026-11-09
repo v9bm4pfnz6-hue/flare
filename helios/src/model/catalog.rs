@@ -51,10 +51,6 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
             .prepared_sequence_tokens
             .is_multiple_of(page_tokens.max(1))
         || page_tokens == 0
-        || !config
-            .limits
-            .max_sequence_tokens
-            .is_multiple_of(page_tokens)
         || config.limits.pages == 0
         || config.limits.pages > i32::MAX as u32
         || config.limits.snapshots > i32::MAX as u32 - (config.limits.request_capacity() + 1) as u32

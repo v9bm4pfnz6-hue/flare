@@ -4,13 +4,34 @@
 
 """Prepared-model ownership through package export and diagnostic execution."""
 
+import hashlib
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import get_ident
 from types import MappingProxyType
 
 import torch
 
 from .execution import PreparedExecution
+
+
+def _native_asset_descriptors(assets, directory):
+    descriptors = {}
+    for name, asset in assets.items():
+        path, text = asset.get("path"), asset.get("text")
+        if (path is None) == (text is None):
+            raise ValueError("native diagnostic assets require exactly one file path or text value")
+        contents = Path(path).read_bytes() if text is None else text.encode("utf-8")
+        digest = hashlib.sha256(contents).hexdigest()
+        if asset.get("sha256") not in (None, digest):
+            raise ValueError(f"frontend asset digest differs for {name}")
+        if text is not None:
+            path = Path(directory, name)
+            path.write_bytes(contents)
+        descriptors[name] = {**asset, "path": str(path), "sha256": digest}
+        descriptors[name].pop("text", None)
+    return descriptors
 
 
 class PreparedModel(PreparedExecution):
@@ -108,7 +129,10 @@ class PreparedModel(PreparedExecution):
             torch.cuda.synchronize(self.device)
             try:
                 arguments = {} if peers is None else {"peer_fds": [peer.fileno() for peer in peers]}
-                server = flare_heliopause.Server(self, manifest, json.dumps(config), **arguments)
+                with TemporaryDirectory(prefix="ignition-native-assets-") as directory:
+                    if "assets" in config:
+                        config["assets"] = _native_asset_descriptors(config["assets"], directory)
+                    server = flare_heliopause.Server(self, manifest, json.dumps(config), **arguments)
             except BaseException as error:
                 if getattr(error, "resources_retained", False):
                     self._startup_undrained = True

@@ -547,6 +547,37 @@ def distributed_group():
 
 
 @torch.no_grad()
+def test_different_gpu_names_use_separate_artifacts_and_tuning(tmp_path, distributed_group):
+    import torch.distributed as dist
+    from ignition.preparation.collectives import CollectivePreparation
+
+    rank = distributed_group
+    names = [None] * dist.get_world_size()
+    dist.all_gather_object(names, torch.cuda.get_device_properties(torch.cuda.current_device()).name)
+    if len(set(names)) == 1:
+        pytest.skip('requires two CUDA devices with different Torch compatibility names')
+    root = [str(tmp_path) if rank == 0 else None]
+    dist.broadcast_object_list(root, src=0)
+    coordinator = CollectivePreparation(dist.group.WORLD)
+    cache = ForwardCache(namespace={'model': 'heterogeneous-device-artifacts'},
+        device=torch.device('cuda', torch.cuda.current_device()), root=Path(root[0]),
+        compile_workers=coordinator.local_ranks)
+    signatures = {'decode': GraphSignature('decode', 1, 1)}
+    forward = ArithmeticForward()
+    bound = cache.prepare_many({'decode': forward}, signatures, coordinator=coordinator,
+        materialize=lambda: None)['decode']
+    _replay(bound, forward)
+    fresh = ArithmeticForward()
+    restored = cache.prepare_many({'decode': fresh}, signatures, coordinator=coordinator,
+        materialize=lambda: None)['decode']
+    assert restored.cache_hit
+    _replay(restored, fresh)
+    artifacts = [sorted(path.name for path in Path(root[0]).rglob('*.bin')) if rank == 0 else None]
+    dist.broadcast_object_list(artifacts, src=0)
+    assert len(artifacts[0]) == 2
+
+
+@torch.no_grad()
 @pytest.mark.parametrize('distinct_variants', [False, True])
 def test_distributed_catalog_reconciles_real_conflicting_candidates(
         tmp_path, monkeypatch, distinct_variants, distributed_group):

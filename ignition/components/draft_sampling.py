@@ -4,9 +4,10 @@
 
 """Bounded top-k draft proposals: filtering and sampling over at most DRAFT_CANDIDATES tokens.
 
-Proposals follow the request policy after penalties, grammar and temperature:
-top-k, softmax, top-p and min-p, each retaining boundary ties among the
-candidates, then renormalization. A request whose top-k exceeds
+Proposals follow the request policy after penalties and grammar, with the
+prepared draft-temperature multiplier applied to request temperature: top-k,
+softmax, top-p and min-p, each retaining boundary ties among the candidates,
+then renormalization. A request whose top-k exceeds
 DRAFT_CANDIDATES, including disabled top-k, proposes from the
 DRAFT_CANDIDATES highest scores. Chain verification receives exactly the
 distribution each draft was drawn from, so verified output is unchanged;
@@ -196,7 +197,7 @@ def _restore_draft_support(Selected, SupportIds, SupportProbabilities, Probabili
 def _draft_score_values(Logits, Bias, Histogram, Candidates, Slots, Params, GrammarMask, GrammarEnabled,
                         hist_stride, mask_stride, candidate_stride, logit_stride, bias_stride,
                         ADD_BIAS: tl.constexpr, CAPACITY: tl.constexpr, V: tl.constexpr,
-                        PREFIX: tl.constexpr, BLOCK: tl.constexpr):
+                        PREFIX: tl.constexpr, BLOCK: tl.constexpr, DRAFT_TEMPERATURE: tl.constexpr):
     # One vocabulary block of one row: the committed histogram plus the row's earlier drafts give the penalty
     # counts; repetition, presence and frequency penalties, temperature and the grammar mask follow the
     # unfused order of operations. The caller reduces each block's maximum.
@@ -224,7 +225,7 @@ def _draft_score_values(Logits, Bias, Histogram, Candidates, Slots, Params, Gram
         adjusted = tl.where(score > 0, tl.math.div_rn(score, repetition), score * repetition)
         score = tl.where(count > 0, adjusted, score)
         score = score - (count > 0).to(tl.float32) * presence - count.to(tl.float32) * frequency
-    score = tl.math.div_rn(score, tl.where(temperature > 0, temperature, 1.))
+    score = tl.math.div_rn(score, tl.where(temperature > 0, temperature * DRAFT_TEMPERATURE, 1.))
     if tl.load(GrammarEnabled + safe) != 0:
         word = tl.load(GrammarMask + safe * mask_stride + token // 32, mask=inside, other=0)
         score = tl.where(((word >> (token % 32)) & 1) != 0, score, -float("inf"))
@@ -234,10 +235,10 @@ def _draft_score_values(Logits, Bias, Histogram, Candidates, Slots, Params, Gram
 @triton.jit
 def _draft_scores(Logits, Histogram, Candidates, Slots, Params, GrammarMask, GrammarEnabled, Scores, BlockMax,
                   hist_stride, mask_stride, candidate_stride, CAPACITY: tl.constexpr, V: tl.constexpr,
-                  PREFIX: tl.constexpr, BLOCK: tl.constexpr, BLOCKS: tl.constexpr):
+                  PREFIX: tl.constexpr, BLOCK: tl.constexpr, BLOCKS: tl.constexpr, DRAFT_TEMPERATURE: tl.constexpr):
     token, inside, score = _draft_score_values(Logits, Logits, Histogram, Candidates, Slots, Params,
         GrammarMask, GrammarEnabled, hist_stride, mask_stride, candidate_stride, V, V,
-        False, CAPACITY, V, PREFIX, BLOCK)
+        False, CAPACITY, V, PREFIX, BLOCK, DRAFT_TEMPERATURE)
     row, block = tl.program_id(0), tl.program_id(1)
     tl.store(Scores + row * V + token, score, mask=inside)
     score = tl.where(inside, score, -float("inf"))
@@ -250,10 +251,11 @@ def _draft_score_candidates(Logits, Bias, Histogram, PrefixIds, Slots, Params, G
                             TopK, Probabilities, LocalCandidates, BlockMax, hist_stride, mask_stride,
                             candidate_stride, logit_stride, bias_stride, ADD_BIAS: tl.constexpr,
                             CAPACITY: tl.constexpr, V: tl.constexpr, PREFIX: tl.constexpr,
-                            BLOCK: tl.constexpr, BLOCKS: tl.constexpr, K: tl.constexpr):
+                            BLOCK: tl.constexpr, BLOCKS: tl.constexpr, K: tl.constexpr,
+                            DRAFT_TEMPERATURE: tl.constexpr):
     tokens, inside, scores = _draft_score_values(Logits, Bias, Histogram, PrefixIds, Slots, Params,
         GrammarMask, GrammarEnabled, hist_stride, mask_stride, candidate_stride, logit_stride,
-        bias_stride, ADD_BIAS, CAPACITY, V, PREFIX, BLOCK)
+        bias_stride, ADD_BIAS, CAPACITY, V, PREFIX, BLOCK, DRAFT_TEMPERATURE)
     row, block = tl.program_id(0), tl.program_id(1)
     # Validity depends on every score, including nonfinite entries outside the selected support.
     tl.store(BlockMax + row * BLOCKS + block, tl.max(tl.where(inside, scores, -float("inf")), 0))
@@ -413,11 +415,14 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
             "shortlist_candidates": ((batch, 4, DRAFT_CANDIDATES), torch.int64)}
 
     def __init__(self, logits, requests, slots, generations, live_rows, candidate_prefix_ids, *,
-                 seed, offset, sampled, prefix_offset=0, workspace=None):
+                 seed, offset, sampled, prefix_offset=0, workspace=None, draft_temperature=1.):
         super().__init__(logits, requests, slots, generations, live_rows, candidate_prefix_ids,
                          prefix_offset=prefix_offset, workspace=workspace)
         if logits.shape[1] != 1:
             raise ValueError("draft proposals cover one position")
+        if not 0 < draft_temperature < float("inf"):
+            raise ValueError("draft temperature must be finite and positive")
+        self.draft_temperature = draft_temperature
         # Fused scoring: per-block maxima of each row before the row reduction.
         self._score_kernels = None
         # Contiguous [B,1,...] storage is addressed by row; kernels receive the base tensors.
@@ -491,7 +496,7 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
                 state.parameters, state.grammar_mask, state.grammar_enabled, self.scores, self.block_max,
                 state.histogram.stride(0), state.grammar_mask.stride(0), self.candidates.stride(0)),
                 (batch, blocks, 1), CAPACITY=state.capacity, V=vocab, PREFIX=self.prefix_offset, BLOCK=_SCORE_BLOCK,
-                BLOCKS=blocks, num_warps=8, enable_fp_fusion=False),
+                BLOCKS=blocks, DRAFT_TEMPERATURE=self.draft_temperature, num_warps=8, enable_fp_fusion=False),
             prepare_triton(_draft_scores_finish, (self.block_max, self.candidates, self.slots,
                 self.generations, self.live_rows, state.generation, state.status, state.top_k, state.parameters,
                 self.maximum, self.valid, self.packed_top_k,
@@ -508,7 +513,8 @@ class PreparedDraftDistribution(PreparedSpeculativeDistributions):
                     self.source_logits.stride(0), bias.stride(0)), (batch, blocks, 1),
                     ADD_BIAS=self.source_bias is not None, CAPACITY=state.capacity, V=vocab,
                     PREFIX=self.prefix_offset, BLOCK=BLOCK, BLOCKS=blocks, K=DRAFT_CANDIDATES,
-                    num_warps=8, enable_fp_fusion=False), self._score_kernels[1])
+                    DRAFT_TEMPERATURE=self.draft_temperature, num_warps=8, enable_fp_fusion=False),
+                self._score_kernels[1])
         self._prepared = True
         self.prepare_scores()
         if self._candidate_kernels is not None:

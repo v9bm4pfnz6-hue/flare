@@ -10,7 +10,7 @@ import torch
 import triton
 
 from ignition.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce
-from ignition.components.owner_packet_reduce import PreparedOwnerPacketAllReduce
+from ignition.components.owner_packet_reduce import PreparedOwnerPacketAllReduce, aligned_extent
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
@@ -24,7 +24,7 @@ from .kda import PreparedKDA
 from .pointwise import rms_norm_columns, situ
 from .projections import prepare_projection
 from .residual import ADD, REPLACE, ResidualStream
-from .routing import MAX_ROWS as ROUTE_ROWS, PreparedRouteGather
+from .routing import MAX_ROWS as ROUTE_ROWS, PreparedLatentShardGather, PreparedRouteGather
 
 
 # A concurrent shared-expert MLP forks onto the auxiliary stream after its input is written and joins before its
@@ -79,9 +79,11 @@ class DecoderStorage:
     @classmethod
     def allocate(cls, config, shard, device, *, scratch=None, allocator=None):
         # Rank-specific offsets stay in tensors so every rank replays rank zero's compiled forward.
-        return cls({} if scratch is None else scratch, torch.arange(*shard.partition(config.hidden), device=device),
-            torch.tensor(shard.partition(config.text["routed_expert_hidden_size"])[:1], dtype=torch.int32, device=device),
-            allocator)
+        return cls({} if scratch is None else scratch,
+            torch.arange(*shard.padded_partition(config.hidden, alignment=64), device=device).clamp(
+                max=config.hidden - 1),
+            torch.tensor(shard.padded_partition(config.text["routed_expert_hidden_size"], alignment=32)[:1],
+                         dtype=torch.int32, device=device), allocator)
 
     def scratch_tensors(self):
         return tuple(self.scratch.values())
@@ -107,8 +109,9 @@ class Scratch:
         def zeros(shape):
             return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if buffers is None
                     else buffers.zeros(shape, torch.bfloat16))
+        vocabulary = -(-config.vocabulary // (world_size * 64)) * 64
         return cls(zeros((tokens, config.hidden)) if activations is None else activations, zeros((rows, config.hidden)),
-                   zeros((rows, config.vocabulary // world_size)), zeros((rows, config.vocabulary)))
+                   zeros((rows, vocabulary)), zeros((rows, config.vocabulary)))
 
     def rows(self, tokens, rows):
         return type(self)(self.activations[:tokens], self.hidden[:rows], self.local_logits[:rows], self.logits[:rows])
@@ -184,10 +187,12 @@ class PreparedMLP:
 
 class PreparedLatentMoE:
     def __init__(self, weights, source, config, shard, *, runtime, router_runtime, coordinator, session, name, workspace, buffers, storage,
-                 route_runtime=None, allocator=None, accumulation_buffers=None):
+                 route_runtime=None, prefill_route_runtime=None, allocator=None, accumulation_buffers=None,
+                 reduction_staging=None):
         tokens, hidden = source.shape
         c, device = config.text, source.device
         latent = c["routed_expert_hidden_size"]
+        local_latent = weights["latent_norm"].shape[0]
 
         def buffer(field, width, dtype=torch.bfloat16):
             # Decode-only fields first appear in a decoder of any row count, so each holds every route row.
@@ -197,21 +202,22 @@ class PreparedLatentMoE:
                                   else allocator.zeros(shape, dtype))
             return buffers[field][:tokens]
 
-        self.source = buffer("source", hidden // shard.world_size)
+        self.source = buffer("source", storage.hidden_columns.numel())
         self.hidden_columns, self.latent_begin = storage.hidden_columns, storage.latent_begin
         self.latent = buffer("latent", latent)
         # The routed experts write where prefill reduces the latent down-projection from, and their sum
         # replaces the latent rows they consumed.
         self.expert_output = buffer("down", latent)
         self.latent_sum = self.latent
-        self.up_input = buffer("up_input", latent // shard.world_size)
+        self.up_input = buffer("up_input", local_latent)
         self.output = buffer("output", hidden)
         self.up = prepare_projection(self.up_input, weights["latent_up"], self.output,
                                       session=session, name=name + ".latent_up", workspace=workspace)
         # Each rank normalizes the full latent row and keeps the columns its up-projection shard reads.
         self.latent_norm, self.eps = weights["latent_norm"], c["rms_norm_eps"]
         reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedOwnerPacketAllReduce
-        reduction_args = {} if accumulation_buffers is None else dict(workspace=accumulation_buffers)
+        reduction_args = ({} if accumulation_buffers is None
+                          else dict(workspace=accumulation_buffers, staging=reduction_staging))
         self.expert_reduce = reduction(self.expert_output, self.latent_sum, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".expert_reduce", **reduction_args)
         local_logits = buffer("local_router", weights["router"].shape[0], torch.float32)
@@ -220,39 +226,54 @@ class PreparedLatentMoE:
             buffers["routes"] = RouterScratch.allocate(tokens, device, experts=c["num_experts"], top_k=c["num_experts_per_token"])
         routes = buffers["routes"].rows(tokens)
         self.route_gather = None
+        self.prefill_route_gather = None
         if route_runtime is not None and tokens <= ROUTE_ROWS:
             # Decode rows gather row-sharded latent and router shards and select experts in one exchange.
             self.down = prepare_projection(source, weights["latent_down_rows"],
-                buffer("local_down", latent // shard.world_size), session=session, name=name + ".latent_down_rows",
+                buffer("local_down", local_latent), session=session, name=name + ".latent_down_rows",
                 workspace=workspace)
             self.route_gather = PreparedRouteGather(self.down.output, local_logits, weights["correction"],
                 self.latent, routes.weights, routes.ids, runtime=route_runtime, session=session,
-                coordinator=coordinator, name=name + ".route_gather")
+                coordinator=coordinator, name=name + ".route_gather",
+                buffers=buffers.setdefault("route_gather_transport", {}), allocator=allocator)
         else:
-            self.down = prepare_projection(self.source, weights["latent_down"], buffer("down", latent),
-                                            session=session, name=name + ".latent_down", workspace=workspace)
-            self.down_reduce = reduction(self.down.output, self.latent, runtime=runtime,
-                coordinator=coordinator, session=session, name=name + ".down_reduce", **reduction_args)
             logits = buffer("router", c["num_experts"], torch.float32)
             self.router_logits = logits
-            local_experts = local_logits.shape[1]
-            router_width = (local_experts + 31) // 32 * 32
-            self.router_input = buffer("router_input", router_width, torch.float32)
-            self.gathered_logits = buffer("gathered_router", router_width * shard.world_size, torch.float32)
-            self.router_columns = self.gathered_logits.view(tokens, shard.world_size, router_width)[:, :, :local_experts]
-            self.router_output = logits.view(tokens, shard.world_size, local_experts)
-            # Gathering BF16 views transports the FP32 logits without conversion or arithmetic.
-            self.router_gather = PreparedChunkedAllGather(self.router_input.view(torch.bfloat16), self.gathered_logits.view(torch.bfloat16),
-                runtime=router_runtime, coordinator=coordinator, session=session, name=name + ".router_gather")
+            if prefill_route_runtime is not None:
+                # Each output column uses the full input width. Only finished
+                # BF16 values cross ranks, without rounded partial dot products.
+                self.down = prepare_projection(source, weights["latent_down_rows"],
+                    buffer("local_down", local_latent), session=session,
+                    name=name + ".latent_down_rows", workspace=workspace)
+                self.prefill_route_gather = PreparedLatentShardGather(self.down.output, local_logits,
+                    self.latent, logits, runtime=prefill_route_runtime, session=session,
+                    coordinator=coordinator, name=name + ".latent_router_gather",
+                    buffers=buffers.setdefault("latent_router_transport", {}), allocator=allocator)
+            else:
+                self.down = prepare_projection(self.source, weights["latent_down"], buffer("down", latent),
+                    session=session, name=name + ".latent_down", workspace=workspace)
+                self.down_reduce = reduction(self.down.output, self.latent, runtime=runtime,
+                    coordinator=coordinator, session=session, name=name + ".down_reduce", **reduction_args)
+                local_experts = local_logits.shape[1]
+                router_width = (local_experts + 31) // 32 * 32
+                self.router_input = buffer("router_input", router_width, torch.float32)
+                self.gathered_logits = buffer("gathered_router", router_width * shard.world_size, torch.float32)
+                self.router_columns = self.gathered_logits.view(tokens, shard.world_size, router_width)[:, :, :local_experts]
+                self.router_output = buffer("router_padded", shard.world_size * local_experts,
+                    torch.float32).view(tokens, shard.world_size, local_experts)
+                # Gathering BF16 views transports the FP32 logits without conversion or arithmetic.
+                self.router_gather = PreparedChunkedAllGather(self.router_input.view(torch.bfloat16), self.gathered_logits.view(torch.bfloat16),
+                    runtime=router_runtime, coordinator=coordinator, session=session, name=name + ".router_gather")
             self.router = PreparedRouter(logits, routes, score_func="sigmoid", correction_bias=weights["correction"],
                 renormalize=True, routed_scaling_factor=c["routed_scaling_factor"], session=session, name=name + ".route")
         self.experts = PreparedRoutedExperts(self.latent, weights["experts"], routes.ids, routes.weights,
             self.expert_output, workspace=workspace, session=session, name=name + ".experts")
-        # Decode and verification rows run the shared experts beside routing and the routed experts.
+        # Gathered routing and routed experts have independent operands and scratch from the shared expert branch.
         self.shared = PreparedMLP(weights["shared"], source, session=session, name=name + ".shared",
                                   buffers=buffers.setdefault("shared", {}), allocator=allocator,
                                   workspace=workspace, parallel_plans=(self.router_projection.plan, self.down.plan,
-                                      self.experts.plan, self.up.plan) if self.route_gather is not None else ())
+                                      self.experts.plan, self.up.plan)
+                                  if self.route_gather is not None or self.prefill_route_gather is not None else ())
 
     def __call__(self, source):
         if self.shared.concurrent:
@@ -261,10 +282,20 @@ class PreparedLatentMoE:
         if self.route_gather is not None:
             self.down(source)
             self.route_gather()
+        elif self.prefill_route_gather is not None:
+            self.down(source)
+            self.prefill_route_gather()
+            self.router(self.router_logits)
         else:
             self.router_input[:, :logits.shape[1]].copy_(logits)
             self.router_gather(self.router_input.view(torch.bfloat16))
             self.router_output.copy_(self.router_columns)
+            local_experts = self.router_output.shape[-1]
+            for rank in range(self.router_output.shape[1]):
+                begin = rank * local_experts
+                count = min(local_experts, self.router_logits.shape[1] - begin)
+                if count > 0:
+                    self.router_logits[:, begin:begin + count].copy_(self.router_output[:, rank, :count])
             self.router(self.router_logits)
             self.source.copy_(source.index_select(1, self.hidden_columns))
             self.down_reduce(self.down(self.source))
@@ -286,7 +317,7 @@ class PreparedDecoder:
 
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, vocabulary_runtime, embedding_runtime, router_runtime, vision_state,
                  coordinator, session, name, workspace, buffers, kda_records=None, route_runtime=None, context=None,
-                 latent_runtimes=(), scoring=None):
+                 latent_runtimes=(), scoring=None, prefill_route_runtime=None):
         # Verification records its candidate rows; other modes ignore records.
         if mode not in ("prefill", "decode", "verify") or mode == "verify" and kda_records is None:
             raise ValueError("Kimi K3 verification decodes recorded candidate rows")
@@ -297,6 +328,7 @@ class PreparedDecoder:
         accumulation_buffers = None
         from b12x.comm.pcie import DmaAllReduce
 
+        reduction_staging = None
         if isinstance(runtime, DmaAllReduce):
             if mode != "prefill":
                 raise ValueError("Kimi copy-engine reductions are prepared only for prefill")
@@ -306,6 +338,15 @@ class PreparedDecoder:
                 buffers.scratch[key] = (torch.zeros(count, dtype=torch.float32, device=source.device)
                     if allocator is None else allocator.zeros((count,), torch.float32))
             accumulation_buffers = buffers.scratch[key]
+            # A payload that is not a whole number of 32-byte FP32 groups per rank reduces through
+            # ring-aligned staging, so prefill graphs below the chunk capacity keep the copy-engine ring.
+            ring_elements = aligned_extent(source.numel(), runtime.world_size) * runtime.world_size
+            if ring_elements != source.numel():
+                key = "prefill_reduction_staging"
+                if key not in buffers.scratch or buffers.scratch[key].numel() < ring_elements:
+                    buffers.scratch[key] = (torch.zeros(ring_elements, dtype=source.dtype, device=source.device)
+                        if allocator is None else allocator.zeros((ring_elements,), source.dtype))
+                reduction_staging = buffers.scratch[key]
         if ("local_embedding" not in buffers.scratch
                 or buffers.scratch["local_embedding"].shape[0] < source.shape[0]):
             shape = (source.shape[0], weights.embedding.shape[1])
@@ -378,13 +419,15 @@ class PreparedDecoder:
                     self.buffers.setdefault("moe", {}).setdefault("shared", {}).setdefault("output", self.buffers["total"])
                 mlp = PreparedLatentMoE(w, source, config, weights.shard, runtime=runtime,
                     router_runtime=router_runtime, route_runtime=route_runtime if mode != "prefill" else None,
+                    prefill_route_runtime=prefill_route_runtime if mode == "prefill" else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace,
                     buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=buffers.stage_allocator("moe"),
-                    accumulation_buffers=accumulation_buffers)
+                    accumulation_buffers=accumulation_buffers, reduction_staging=reduction_staging)
             # The sum buffer is consumed before the next attention or MLP reduction.
             total = self.buffers["total"][:source.shape[0]]
             reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedOwnerPacketAllReduce
-            reduction_args = {} if accumulation_buffers is None else dict(workspace=accumulation_buffers)
+            reduction_args = ({} if accumulation_buffers is None
+                              else dict(workspace=accumulation_buffers, staging=reduction_staging))
             reduce = reduction(source, total, runtime=runtime, coordinator=coordinator,
                                session=session, name=prefix + ".reduce", **reduction_args)
             self.layers.append((w, attention, mlp, reduce))

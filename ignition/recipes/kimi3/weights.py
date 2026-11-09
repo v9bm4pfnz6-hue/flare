@@ -12,7 +12,7 @@ import torch
 from ignition.components.weights import (DirectWeightLoader, SharedColumnReads, fp4_down_staging_bytes,
                                          quantize_bf16_linear_as_mxfp8)
 
-from .config import DSparkConfig, LatentDSparkConfig, ModelConfig
+from .config import DSparkConfig, LatentDSparkConfig, ModelConfig, expert_intermediate_range
 from .residual import score_weight
 
 PREFIX = "language_model.model"
@@ -47,13 +47,14 @@ class ModelWeights:
         with KimiWeightLoader(manifest, device, shard=shard, progress=progress, online_mxfp8=online_mxfp8,
                               peers=peers, index_partitioning=index_partitioning) as loader:
             config = replace(loader.config, draft=None)
-            embedding = pack(loader.linear(f"{PREFIX}.embed_tokens", columns=shard.partition(config.hidden, alignment=64)))
+            embedding = pack(loader.linear(f"{PREFIX}.embed_tokens",
+                                           columns=shard.padded_partition(config.hidden, alignment=64)))
             norm, res_norm, res_proj = loader.load_tensors(tuple(f"{PREFIX}.{n}.weight" for n in
                 ("norm", "output_attn_res_norm", "output_attn_res_proj")))
             norm, output_res_score = pack(norm), pack(score_weight(res_norm, res_proj))
             del res_norm, res_proj
-            head = pack(loader.load_tensor("language_model.lm_head.weight",
-                extent=slice(*shard.partition(config.vocabulary, alignment=64))))
+            head = pack(loader.linear("language_model.lm_head",
+                                      rows=shard.padded_partition(config.vocabulary, alignment=64)))
             layers = []
             for index in range(len(config.layers)):
                 layer = loader.load_layer(index)
@@ -104,7 +105,10 @@ class KimiWeightLoader(DirectWeightLoader):
         # Online conversion stores attention, shared-expert, and latent projections as E4M3 values
         # with E8M0 block-32 scales; their activations stay BF16.
         self.online_mxfp8 = online_mxfp8
-        self.index_partitioning = (index_partitioning and shard.world_size > 1
+        index_heads = self.config.text.get("dsa_config", {}).get("index_num_heads", 32)
+        # Output-partitioned DSA also partitions prefill rows into complete strided owner sets.
+        # Non-divisible topologies keep the release's replicated BF16 index projection instead.
+        self.index_partitioning = (index_partitioning and shard.world_size > 1 and index_heads % shard.world_size == 0
                                    and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)))
         self.config.validate_shard(shard)
         self.scale_scratch = None
@@ -143,19 +147,40 @@ class KimiWeightLoader(DirectWeightLoader):
         source = self._sources[prefix + ".weight"]
         if source.ndim != 2 or source.dtype != torch.bfloat16:
             raise ValueError(f"{prefix}: expected unquantized BF16 projection")
+        r0, r1 = rows or (0, source.shape[0])
+        c0, c1 = columns or (0, source.shape[1])
+        if min(r0, c0) < 0 or r1 < r0 or c1 < c0:
+            raise ValueError(f"{prefix}: invalid projection partition")
         shared = self._shared_reads() if rows is None and columns is not None else None
         if shared is not None:
-            out = torch.empty((source.shape[0], columns[1] - columns[0]), dtype=source.dtype, device=self.device)
-            return shared.read_columns(self, source, columns, out)
-        return self.load_tensor(prefix + ".weight", extent=(slice(*(rows or (0, source.shape[0]))),
-            slice(*(columns or (0, source.shape[1])))))
+            out = torch.zeros((source.shape[0], c1 - c0), dtype=source.dtype, device=self.device)
+            count = max(0, min(c1, source.shape[1]) - c0)
+            if count:
+                shared.read_columns(self, source, (c0, c0 + count), out[:, :count])
+            return out
+        if r1 > source.shape[0] or c1 > source.shape[1]:
+            out = torch.zeros((r1 - r0, c1 - c0), dtype=source.dtype, device=self.device)
+            rows_count = max(0, min(r1, source.shape[0]) - r0)
+            columns_count = max(0, min(c1, source.shape[1]) - c0)
+            if rows_count and columns_count:
+                self._copy(out[:rows_count, :columns_count],
+                           source[r0:r0 + rows_count, c0:c0 + columns_count])
+                self._session.flush()
+            return out
+        return self.load_tensor(prefix + ".weight", extent=(slice(r0, r1), slice(c0, c1)))
+
+    def tensor_rows(self, name, rows):
+        source = self._sources.get(name)
+        if source is None or rows[1] <= source.shape[0]:
+            return self.load_tensor(name, extent=slice(*rows))
+        return super().load_padded_tensor(name, rows=rows)
 
     def fused(self, prefixes, ranges):
         values = [self.linear(p, rows=r) for p, r in zip(prefixes, ranges, strict=True)]
         return torch.cat(values)
 
     def mlp(self, prefix, intermediate, *, online_mxfp8=False):
-        interval = self.shard.partition(intermediate, alignment=32)
+        interval = self.shard.padded_partition(intermediate, alignment=32)
         weights = dict(gate_up=self.fused([prefix + ".gate_proj", prefix + ".up_proj"], [interval] * 2),
                        down=self.linear(prefix + ".down_proj", columns=interval))
         return {key: quantize_bf16_linear_as_mxfp8(weight, retain_scale_rows=False)
@@ -166,7 +191,7 @@ class KimiWeightLoader(DirectWeightLoader):
         prefix = f"{PREFIX}.layers.{index}"
         a = prefix + ".self_attn"
         heads = c["linear_attn_config"]["num_heads"] if self.config.layers[index] == "kda" else c["num_attention_heads"]
-        h0, h1 = shard.partition(heads)
+        h0, h1 = shard.padded_partition(heads)
         head_rows = h0 * 128, h1 * 128
         attention = {}
         if self.config.layers[index] == "kda":
@@ -178,14 +203,14 @@ class KimiWeightLoader(DirectWeightLoader):
             projected = torch.cat((projected, projected.new_zeros((padding, projected.shape[1]))))
             attention["input"] = projected
             attention["forget"] = self.linear(a + ".f_b_proj", rows=head_rows)
-            conv = [self.load_tensor(a + "." + n + ".weight", extent=slice(*head_rows))
+            conv = [self.tensor_rows(a + "." + n + ".weight", rows=head_rows)
                     for n in ("q_conv1d", "k_conv1d", "v_conv1d")]
             attention["convolution"] = torch.cat(conv).squeeze(1)
             log = self._sources[a + ".A_log"]
             if tuple(log.shape) not in ((heads,), ((heads + 127) // 128 * 128,)) or log.dtype != torch.float32:
                 raise ValueError(f"{a}.A_log must cover the logical heads, optionally padded to 128")
-            attention["A_log"] = self.load_tensor(a + ".A_log", extent=slice(h0, h1))
-            attention["dt_bias"] = self.load_tensor(a + ".dt_bias", extent=slice(*head_rows))
+            attention["A_log"] = self.tensor_rows(a + ".A_log", rows=(h0, h1))
+            attention["dt_bias"] = self.tensor_rows(a + ".dt_bias", rows=head_rows)
             attention["norm"] = self.load_tensor(a + ".o_norm.weight")
         else:
             attention["q_b"] = self.linear(a + ".q_b_proj", rows=(h0 * 192, h1 * 192))
@@ -197,9 +222,9 @@ class KimiWeightLoader(DirectWeightLoader):
         if self.config.layers[index] != "kda":
             # This rank's query and KV latent rows beside its output gate; the ranks gather the latents, as
             # vLLM's VLLM_KIMI_SHARD_QKV_A does. Zero rows pad the latent shard to the exchange's 16-byte width.
-            latent = (self.linear(a + ".q_a_proj", rows=shard.partition(c["q_lora_rank"])),
+            latent = (self.linear(a + ".q_a_proj", rows=shard.padded_partition(c["q_lora_rank"])),
                       self.linear(a + ".kv_a_proj_with_mqa",
-                                  rows=shard.partition(c["kv_lora_rank"] + c["qk_rope_head_dim"])))
+                                  rows=shard.padded_partition(c["kv_lora_rank"] + c["qk_rope_head_dim"])))
             gate = self.linear(a + ".g_proj", rows=head_rows)
             width = sum(x.shape[0] for x in latent)
             suffix = ()
@@ -240,26 +265,28 @@ class KimiWeightLoader(DirectWeightLoader):
         m = prefix + ".block_sparse_moe"
         result["shared"] = self.mlp(m + ".shared_experts", c["num_shared_experts"] * c["moe_intermediate_size"],
                                     online_mxfp8=self.online_mxfp8)
-        result["router"] = self.linear(m + ".gate", rows=shard.partition(c["num_experts"], alignment=8))
+        result["router"] = self.linear(m + ".gate", rows=shard.padded_partition(c["num_experts"], alignment=8))
         result["correction"] = self.load_tensor(m + ".gate.e_score_correction_bias")
-        result["latent_down"] = self.linear(m + ".routed_expert_down_proj", columns=shard.partition(c["hidden_size"]))
+        result["latent_down"] = self.linear(m + ".routed_expert_down_proj",
+                                            columns=shard.padded_partition(c["hidden_size"], alignment=64))
         # Decode rows project their own latent rows and gather them with the router shards.
         result["latent_down_rows"] = self.linear(m + ".routed_expert_down_proj",
-                                                 rows=shard.partition(c["routed_expert_hidden_size"]))
-        result["latent_up"] = self.linear(m + ".routed_expert_up_proj", columns=shard.partition(c["routed_expert_hidden_size"]))
+                                                 rows=shard.padded_partition(c["routed_expert_hidden_size"], alignment=32))
+        result["latent_up"] = self.linear(m + ".routed_expert_up_proj",
+                                          columns=shard.padded_partition(c["routed_expert_hidden_size"], alignment=32))
         if self.online_mxfp8:
             for key in ("latent_down", "latent_down_rows", "latent_up"):
                 result[key] = quantize_bf16_linear_as_mxfp8(result[key], retain_scale_rows=False)
         # Each rank applies the latent norm's weights to the columns its up-projection shard reads.
-        result["latent_norm"] = self.load_tensor(m + ".routed_expert_norm.weight",
-                                                 extent=slice(*shard.partition(c["routed_expert_hidden_size"])))
+        result["latent_norm"] = self.tensor_rows(m + ".routed_expert_norm.weight",
+            rows=shard.padded_partition(c["routed_expert_hidden_size"], alignment=32))
         prefixes = [f"{m}.experts.{i}" for i in range(c["num_experts"])]
         formats = {self.config.projection_format(f"{p}.{projection}") for p in prefixes for projection in ("w1", "w2", "w3")}
         if formats == {"exl3"}:
             result["experts"], result["expert_trellis"] = self.load_exl3_experts(index,
                 num_experts=c["num_experts"], hidden_size=c["routed_expert_hidden_size"],
                 intermediate_size=c["moe_intermediate_size"],
-                intermediate_range=shard.partition(c["moe_intermediate_size"], alignment=128),
+                intermediate_range=expert_intermediate_range(shard, index, c["moe_intermediate_size"]),
                 activation="situ")
             return result
         if len(formats) != 1 or not formats <= {"mxfp4", "mxfp4_csf"}:
@@ -275,13 +302,13 @@ class KimiWeightLoader(DirectWeightLoader):
             # checkpoint encodings keep the same resident form; gate/up follow b12x's w31 order.
             result["experts"] = self.load_fp4_experts(prefixes, hidden_size=hidden,
                 intermediate_size=c["moe_intermediate_size"], format="mxfp4", activation_mode=EXPERT_ACTIVATION,
-                intermediate_range=shard.partition(c["moe_intermediate_size"], alignment=32),
+                intermediate_range=shard.padded_partition(c["moe_intermediate_size"], alignment=32),
                 projection_names=("w1", "w3", "w2"), weight_name="weight_packed", activation="situ",
                 w13_layout="w31", scale_compression="csf", scale_scratch=self.scale_scratch,
                 shared_columns=self._shared_reads())
             return result
         result["experts"] = self.load_mxfp4_csf_experts(prefixes, hidden_size=hidden,
-            intermediate_size=c["moe_intermediate_size"], intermediate_range=shard.partition(c["moe_intermediate_size"], alignment=32),
+            intermediate_size=c["moe_intermediate_size"], intermediate_range=shard.padded_partition(c["moe_intermediate_size"], alignment=32),
             projection_names=("w1", "w3", "w2"), weight_name="weight_packed",
             activation="situ", activation_mode=EXPERT_ACTIVATION, scale_scratch=self.scale_scratch)
         return result

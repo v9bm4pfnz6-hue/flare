@@ -833,6 +833,12 @@ pub struct ServingOptions {
     #[arg(long, value_name = "N", help_heading = "Serving options")]
     pub max_concurrency: Option<NonZeroUsize>,
 
+    /// Load only these captured dedicated prefill capacities, retaining the prepared maximum.
+    /// Omitted: all captured capacities. Smaller prompts use padding or multiple steps.
+    #[arg(long, value_name = "N[,N...]", value_delimiter = ',', action = clap::ArgAction::Set,
+        help_heading = "Advanced serving options")]
+    pub prefill_graph_capacities: Option<Vec<usize>>,
+
     /// Storage for auxiliary embedding tables (PLE/Engram) [default: disk].
     #[arg(long, value_name = "MODE", help_heading = "Serving options",
         value_parser = PossibleValuesParser::new(["disk", "ram"])
@@ -1036,6 +1042,10 @@ impl ServingOptions {
         if let Some(n) = self.max_concurrency {
             options.extend(["--max-concurrency".into(), n.to_string()]);
         }
+        if let Some(capacities) = &self.prefill_graph_capacities {
+            options.extend(["--prefill-graph-capacities".into(),
+                capacities.iter().map(usize::to_string).collect::<Vec<_>>().join(",")]);
+        }
         if let Some(n) = self.mtp_draft_tokens {
             options.extend(["--mtp-draft-tokens".into(), n.to_string()]);
         }
@@ -1139,6 +1149,7 @@ impl ServingOptions {
             },
             embedding_table_workers: self.embedding_table_workers,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
+            prefill_graph_capacities: self.prefill_graph_capacities.clone(),
             mtp_draft_tokens: self.mtp_draft_tokens,
             history_drafts: if self.history_drafts {
                 Some(true)
@@ -1391,6 +1402,7 @@ mod tests {
                 .contains(&"--embedding-table-cache-size".to_owned())
         );
         assert_eq!(options.max_concurrency, None);
+        assert_eq!(options.prefill_graph_capacities, None);
         assert_eq!(options.kv_cache_limit, KvCacheLimit::Memory);
         assert_eq!(options.memory_limit, None);
         assert_eq!(options.mtp_draft_tokens, None);
@@ -1399,6 +1411,18 @@ mod tests {
         assert_eq!(options.mtp_max_verification_token_budget, None);
         assert_eq!(options.adaptive_verification, None);
         assert_eq!(options.prefix_cache, PrefixCacheOffload::default());
+    }
+
+    #[test]
+    fn prefill_graph_capacities_reach_loader_and_round_trip_to_peer_ranks() {
+        let args = run(&["flare", "run", "model.safetensors", "--prefill-graph-capacities", "128,4096"]);
+        assert_eq!(args.load_options().prefill_graph_capacities, Some(vec![128, 4096]));
+        let peer = args.rank_options();
+        assert!(peer.windows(2).any(|pair| pair == ["--prefill-graph-capacities", "128,4096"]));
+        let mut command = vec!["flare", "run", "model.safetensors"];
+        command.extend(peer.iter().map(String::as_str));
+        let reloaded = run(&command);
+        assert_eq!(reloaded.load_options().prefill_graph_capacities, args.load_options().prefill_graph_capacities);
     }
 
     #[test]

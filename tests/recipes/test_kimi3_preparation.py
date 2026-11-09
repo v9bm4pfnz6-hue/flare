@@ -56,7 +56,8 @@ def test_preparation_preserves_declared_context_above_estimated_physical_capacit
         prompt_logprobs=False, compile_workers=1, autotune_effort="default", tuning_replica=None,
         native_dense_activations=False, lock_gpu_clocks=False, world_size=8, context=48128, checkpoint=None,
         recipe=SimpleNamespace(context=1048576), concurrency=1, image_concurrency=0,
-        prefill_chunk=1024, snapshots=1, costs=SimpleNamespace(state_row_bytes=1),
+        prefill_chunk=1024, prefill_graph_capacities=None,
+        snapshots=1, costs=SimpleNamespace(state_row_bytes=1),
         headroom_bytes=0, reserve_bytes=0, online_mxfp8=True, stream_overlap=True,
         context_parallel=True, language_model_only=True)
     bootstrap = SimpleNamespace(PreparationConfig=config_type,

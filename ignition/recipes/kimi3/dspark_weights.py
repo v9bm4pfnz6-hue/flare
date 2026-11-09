@@ -54,21 +54,20 @@ class DraftWeights:
         d = config.draft
         d.validate_shard(shard)
         c, hidden = d.text, config.hidden
-        q_rows = shard.partition(d.heads * d.head_dim, alignment=d.head_dim)
-        kv_rows = shard.partition(d.kv_heads * d.head_dim, alignment=d.head_dim)
-        intermediate = shard.partition(c["intermediate_size"], alignment=32)
-        vocabulary = shard.partition(config.vocabulary, alignment=64)
+        q_rows = shard.padded_partition(d.heads * d.head_dim, alignment=d.head_dim)
+        kv_rows = shard.padded_partition(d.kv_heads * d.head_dim, alignment=d.head_dim)
+        intermediate = shard.padded_partition(c["intermediate_size"], alignment=32)
+        vocabulary = shard.padded_partition(config.vocabulary, alignment=64)
         manifest = inspect_indexed_checkpoint(snapshot)
         layers, context = [], []
         with DirectWeightLoader(manifest, device, progress=progress, progress_label="Load draft weights") as loader:
             def matrix(name, rows=None, columns=None):
-                value = loader.load_tensor(name + ".weight", extent=(slice(*(rows or (None, None))),
-                                                                     slice(*(columns or (None, None)))))
+                value = loader.load_padded_tensor(name + ".weight", rows=rows, columns=columns)
                 if value.dtype != torch.bfloat16 or value.ndim != 2:
                     raise ValueError(f"Kimi K3 DSpark requires BF16 matrices: {name}")
                 return value
 
-            projection = matrix("fc", rows=shard.partition(hidden, alignment=64))
+            projection = matrix("fc", rows=shard.padded_partition(hidden, alignment=64))
             if projection.shape[1] != len(d.auxiliary_layers) * hidden:
                 raise ValueError("DSpark fc must combine one hidden state per auxiliary layer")
             projection = stored(projection)
@@ -87,7 +86,7 @@ class DraftWeights:
                                                    for name in ("gate_proj", "up_proj")])),
                                  stored(matrix(prefix + ".mlp.down_proj", columns=intermediate)))
                 layers.append(DraftLayerWeights(qkv, output, query_norm, key_norm, input_norm, post_norm, mlp))
-            embedding = matrix("embed_tokens", columns=shard.partition(hidden, alignment=64))
+            embedding = matrix("embed_tokens", columns=shard.padded_partition(hidden, alignment=64))
             head = matrix("lm_head", rows=vocabulary)
             # Kimi K3's DSpark draft reuses the target's output head; keep a copy only for drafts that differ.
             head = None if torch.equal(head, target_head) else head

@@ -46,7 +46,7 @@ def _rms_norm(Source, Weight, Output, Begin, source_stride, output_stride, eps, 
     value = tl.load(Source + row * source_stride + columns, valid, other=0.).to(tl.float32)
     normalized = (value * tl.rsqrt(tl.sum(value * value) / WIDTH + eps)).to(Output.dtype.element_ty)
     begin = tl.load(Begin) if OFFSET else 0
-    keep = (columns >= begin) & (columns < begin + OUTPUT_WIDTH)
+    keep = valid & (columns >= begin) & (columns < begin + OUTPUT_WIDTH)
     weight = tl.load(Weight + columns - begin, keep, other=0.).to(tl.float32)
     tl.store(Output + row * output_stride + columns - begin, (weight * normalized.to(tl.float32)).to(Output.dtype.element_ty), keep)
 

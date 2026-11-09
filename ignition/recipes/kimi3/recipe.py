@@ -35,7 +35,8 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         drafting = dict(speculative_widths=plan.speculation.widths, speculative_fixed_width=plan.speculation.fixed_width,
                         speculative_token_capacity=plan.speculative_token_capacity,
                         speculative_graph_budget=plan.speculation.graph_budget or 64,
-                        draft_head_quantization=plan.speculation.draft_head_quantization)
+                        draft_head_quantization=plan.speculation.draft_head_quantization,
+                        draft_temperature=plan.speculation.draft_temperature or 1.)
         directory = draft_directory or DRAFT_DIRECTORY
         if (Path(snapshot) / directory).is_dir():
             drafting["draft_checkpoint"] = str(Path(snapshot) / directory)
@@ -52,6 +53,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         # The planning estimate must not truncate the graph's addressable range.
         devices=tuple(range(plan.world_size)), context=plan.recipe.context,
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, prefill_chunk_size=plan.prefill_chunk,
+        prefill_graph_capacities=plan.prefill_graph_capacities,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8,
@@ -85,7 +87,7 @@ RECIPE = Recipe(
         architecture="KimiK3ForConditionalGeneration", stored_bytes=1_500_516_228_062,
         device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000)),
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
+    speculation=Speculation(draft_tokens=5, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     verification_rows=0,
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.

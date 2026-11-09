@@ -97,10 +97,11 @@ def _kernel_globals(graph):
 
 
 class InductorSelections:
-    """One canonical winner per exact generated kernel across a preparation catalog."""
+    """One canonical winner per generated kernel and Torch CUDA compatibility name."""
 
     def __init__(self, device, *, coordinator=None, lock_gpu_clocks=False):
         self.device = torch.device(device)
+        self.device_name = torch.cuda.get_device_properties(self.device).name
         self.coordinator = coordinator
         self.lock_gpu_clocks = lock_gpu_clocks
         self.winners = {}
@@ -148,7 +149,7 @@ class InductorSelections:
                     f'generated Inductor kernel {name!r} in graph {graph.cache_key} lacks its static '
                     f'autotuner binding: live_type={kind}, source_key={cache_key}, '
                     f'bundled={cache_key in entries}, static_entries={len(entries)}')
-            identity = CompiledTritonKernels.key(_device_source(source, original, 0))
+            identity = self.device_name, CompiledTritonKernels.key(_device_source(source, original, 0))
             bindings[cache_key] = identity, entries[cache_key], tuner
             instances = self.instances.setdefault(identity, {})
             if id(tuner) not in instances:
@@ -226,7 +227,7 @@ class InductorSelections:
         bindings = self.forwards[id(bound)][2]
         inventory = sorted({identity for identity, _, _ in bindings.values()})
         variants = {}
-        for variant, identities in self._gather((getattr(bound.owner, 'compilation_variant', 'shared'), inventory)):
+        for variant, identities in self._gather(((getattr(bound.owner, 'compilation_variant', 'shared'), self.device_name), inventory)):
             if variant in variants and variants[variant] != identities:
                 raise RuntimeError(f"equivalent compiled forward variant {variant!r} has different Inductor kernels")
             variants[variant] = identities

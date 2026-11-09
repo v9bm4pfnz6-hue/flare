@@ -38,17 +38,16 @@ class DraftWeights:
         validate_metadata(manifest, config.draft)
         d, h = config.draft, config.hidden
         d.validate_shard(shard)
-        h0, h1 = shard.partition(d.heads)
-        q_range, kv_range = shard.partition(1536), shard.partition(576)
-        intermediate = shard.partition(d.text["intermediate_size"], alignment=32)
-        conv_range = shard.partition(4 * h // 16, alignment=8)
+        h0, h1 = shard.padded_partition(d.heads)
+        q_range, kv_range = shard.padded_partition(1536), shard.padded_partition(576)
+        intermediate = shard.padded_partition(d.text["intermediate_size"], alignment=32)
+        conv_range = shard.padded_partition(4 * h // 16, alignment=8)
         pack = (partial(quantize_bf16_linear_as_mxfp8, retain_scale_rows=False)
                 if online_mxfp8 else lambda weight: weight)
         with DirectWeightLoader(manifest, device, progress=progress, progress_label="Load draft weights") as loader:
             def matrix(name, rows=None, columns=None):
-                return loader.load_tensor(name + ".weight", extent=(slice(*(rows or (None, None))),
-                    slice(*(columns or (None, None)))))
-            project = pack(matrix("fc", rows=shard.partition(h, alignment=64)))
+                return loader.load_padded_tensor(name + ".weight", rows=rows, columns=columns)
+            project = pack(matrix("fc", rows=shard.padded_partition(h, alignment=64)))
             hidden_norm, norm = loader.load_tensors(("hidden_norm.weight", "norm.weight"))
             layers, context = [], []
             for i in range(d.layers):
