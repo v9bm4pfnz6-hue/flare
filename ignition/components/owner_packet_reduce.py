@@ -21,6 +21,28 @@ def aligned_extent(elements, world):
     return -(-elements // groups) * 8
 
 
+def packet_intervals(elements, world, workspace_elements, max_bytes):
+    """Ring-aligned element intervals one prepared owner channel reduces.
+
+    The intervals tile the ring-aligned extent exactly once. A workspace sized
+    to the aligned extent keeps an unaligned payload (a 128-row prefill graph)
+    inside one ring invocation instead of a full invocation for the tail
+    remainder.
+    """
+
+    extent = aligned_extent(elements, world)
+    capacity = min(int(workspace_elements), int(max_bytes) // 4) // world // 8 * 8
+    if capacity <= 0:
+        raise ValueError(
+            "owner-packet scratch cannot hold one aligned element group per rank"
+        )
+    intervals = []
+    for first in range(0, extent, capacity):
+        end = min(first + capacity, extent)
+        intervals.append((first, end))
+    return extent, tuple(intervals)
+
+
 class PreparedOwnerPacketAllReduce:
     """Promote, reduce in place, and round once without a full-sized FP32 copy.
 
@@ -103,15 +125,12 @@ class PreparedOwnerPacketAllReduce:
                 )
             # Padding rows stay zero: every rank contributes zero there, so the ring rewrites zeros.
             self.padded = staging[: self.extent * self.world]
-        capacity = min(workspace.numel(), runtime.max_bytes // 4) // self.world // 8 * 8
-        if capacity == 0:
-            raise ValueError(
-                "owner-packet scratch cannot hold one aligned element group per rank"
-            )
         self.output, self.parts = output, []
         self.workspace = workspace
-        for first in range(0, self.extent, capacity):
-            end = min(first + capacity, self.extent)
+        _, intervals = packet_intervals(
+            elements, self.world, workspace.numel(), runtime.max_bytes
+        )
+        for first, end in intervals:
             packet = workspace.view(-1)[: self.world * (end - first)].view(
                 self.world, end - first
             )

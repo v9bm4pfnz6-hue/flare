@@ -332,15 +332,16 @@ class PreparedDecoder:
         if isinstance(runtime, DmaAllReduce):
             if mode != "prefill":
                 raise ValueError("Kimi copy-engine reductions are prepared only for prefill")
-            count = min(source.numel(), runtime.max_bytes // 4)
+            # Size the FP32 packet workspace to the ring-aligned extent, not the raw payload:
+            # an unaligned prefill shape otherwise reduces its 64-element alignment tail as a
+            # second, fully synchronized ring invocation.
+            ring_elements = aligned_extent(source.numel(), runtime.world_size) * runtime.world_size
+            count = min(ring_elements, runtime.max_bytes // 4)
             key = "prefill_reduction_workspace"
             if key not in buffers.scratch or buffers.scratch[key].numel() < count:
                 buffers.scratch[key] = (torch.zeros(count, dtype=torch.float32, device=source.device)
                     if allocator is None else allocator.zeros((count,), torch.float32))
             accumulation_buffers = buffers.scratch[key]
-            # A payload that is not a whole number of 32-byte FP32 groups per rank reduces through
-            # ring-aligned staging, so prefill graphs below the chunk capacity keep the copy-engine ring.
-            ring_elements = aligned_extent(source.numel(), runtime.world_size) * runtime.world_size
             if ring_elements != source.numel():
                 key = "prefill_reduction_staging"
                 if key not in buffers.scratch or buffers.scratch[key].numel() < ring_elements:
