@@ -89,11 +89,8 @@ def test_gather_thread_tuning_keeps_other_kimi_collective_settings():
 
     assert KIMI3.b12x_environment["B12X_PCIE_DCP_THREADS"] == "512"
     assert RECIPE.b12x_environment == {**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0",
-                                       "B12X_PCIE_DCP_BLOCK_LIMIT": "64",
-                                       "B12X_PCIE_DCP_BLOCK_LIMIT_MIN_ROWS": "512"}
+                                       "B12X_PCIE_DCP_BLOCK_LIMIT": "64"}
     assert RECIPE.b12x_environment["B12X_PCIE_DCP_BLOCK_LIMIT"] == "64"
-    # The wide-grid override only applies to prepared shapes at or above this row threshold.
-    assert RECIPE.b12x_environment["B12X_PCIE_DCP_BLOCK_LIMIT_MIN_ROWS"] == "512"
 
 
 def test_exl3_keeps_sparse_attention_and_bf16_projections(raw):
