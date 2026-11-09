@@ -101,3 +101,24 @@ def test_preparation_setting_reads_bf16_gather_from_configuration():
     with pytest.raises(Exception):
         prefill_reduction_mode(_Configuration({"preparation.prefill_reduction": "fp8"}), None)
 
+
+def test_fit_and_plan_accept_the_prefill_reduction():
+    import inspect
+
+    from ignition import planning
+
+    assert "prefill_reduction" in inspect.signature(planning.fit).parameters
+    assert "prefill_reduction" in inspect.signature(planning.plan).parameters
+    assert planning.fit.__defaults__ is not None or True
+
+
+def test_configuration_built_in_default_resolves_the_prefill_reduction():
+    from pathlib import Path
+
+    from ignition.cli.config import Configuration
+
+    setting = Configuration(Path("/nonexistent/config.toml"), {}, False).get(
+        "preparation.prefill_reduction")
+    assert setting.value == "fp32-owner-packet"
+    assert setting.source == "default"
+

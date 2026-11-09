@@ -445,7 +445,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False,
-        language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+        language_model_only: bool = False, mla_compute_mode: str | None = None,
+        prefill_reduction: str = "fp32-owner-packet") -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
     Weights come from the checkpoint's stored tensors and graphs and scratch from
@@ -620,7 +621,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
                    online_mxfp8=online_mxfp8, language_model_only=language_model_only,
-                   mla_compute_mode=mla_compute_mode)
+                   mla_compute_mode=mla_compute_mode, prefill_reduction=prefill_reduction)
 
     def automatic(world_size, **settings):
         """Plan the first GPUs that each fit, else the GPUs with the most free memory."""
