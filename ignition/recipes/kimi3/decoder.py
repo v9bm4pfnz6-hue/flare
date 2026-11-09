@@ -467,7 +467,7 @@ class PreparedDecoder:
         active = m.lengths > 0
         d.query_start_loc.copy_(m.query_start_loc)
         d.convolution_slots.copy_(torch.where(active, m.state_rows, -1))
-        d.fresh.copy_(m.starts == 0)
+        torch.eq(m.starts, 0, out=d.fresh)
         d.state_indices[:, 0].copy_(m.state_rows)
         d.initial_state_indices.copy_(torch.where(m.starts > 0, m.state_rows, 0))
         d.final_state_indices.copy_(m.state_rows)
@@ -504,5 +504,5 @@ class PreparedDecoder:
             score=self.weights.output_res_score, norm=self.weights.norm, eps=eps, output_eps=eps)
         if self.scoring is not None:
             self.scoring()
-        self.scratch.hidden.copy_(hidden[m.sample_indices])
+        torch.index_select(hidden, 0, m.sample_indices, out=self.scratch.hidden)
         self.head(self.scratch.hidden)
