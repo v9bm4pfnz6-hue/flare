@@ -14,7 +14,7 @@ payloads are covered.
 import pytest
 import torch
 
-from ignition.recipes.kimi3.routing import PreparedRouteGather
+from ignition.recipes.kimi3.routing import PreparedRouteGather, _copy_rank_major_blocks
 
 
 def _owner(latent, gathered_latent, logits, gathered_logits):
@@ -107,3 +107,49 @@ def test_compaction_copies_the_logical_prefix_only():
 
     assert torch.equal(latent.view(torch.int16), gathered_latent[:, :3584].view(torch.int16))
     assert torch.equal(logits.view(torch.int32), gathered_logits[:, :896].view(torch.int32))
+
+
+def _reference_chunk_copy(destination, received, block):
+    """Per-rank copy of a [rows, world, columns] gather into rank-major rows."""
+
+    for rank in range(received.shape[1]):
+        begin = rank * block
+        count = min(block, destination.shape[1] - begin)
+        if count > 0:
+            destination[:, begin:begin + count].copy_(received[:, rank, :count])
+
+
+# world, rows, chunk rows, destination width, received block width. The worlds
+# and widths cover a full final block (2/4), a clipped final block (9/12), and
+# a destination that is an exact multiple of the block.
+CHUNK_CASES = (
+    (2, 6, 6, 3584, 1792),
+    (4, 6, 6, 3584, 896),
+    (9, 6, 6, 3584, 416),
+    (9, 32, 8, 3584, 416),
+    (9, 6, 1, 3584, 416),
+    (9, 6, 6, 3744, 416),
+    (12, 6, 6, 3584, 320),
+    (16, 6, 6, 3584, 224),
+)
+
+
+@pytest.mark.parametrize(
+    ("world", "rows", "chunk_rows", "width", "block"), CHUNK_CASES
+)
+def test_batched_chunk_copy_equals_per_rank_copies(world, rows, chunk_rows, width, block):
+    generator = torch.Generator().manual_seed(world * 7919 + rows + chunk_rows)
+    received = torch.randn(rows, world, block, generator=generator).to(torch.bfloat16)
+    received[0, 0, 0] = float("nan")
+    received[-1, -1, -1] = float("-inf")
+    received_before = received.clone()
+
+    destination = torch.full((rows, width), float("nan"), dtype=torch.bfloat16)
+    reference = destination.clone()
+    for begin in range(0, rows, chunk_rows):
+        end = min(rows, begin + chunk_rows)
+        _copy_rank_major_blocks(destination[begin:end], received[begin:end], block)
+        _reference_chunk_copy(reference[begin:end], received[begin:end], block)
+
+    assert torch.equal(destination.view(torch.int16), reference.view(torch.int16))
+    assert torch.equal(received.view(torch.int16), received_before.view(torch.int16))

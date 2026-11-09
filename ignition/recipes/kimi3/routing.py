@@ -22,6 +22,28 @@ _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
 
 
+def _copy_rank_major_blocks(destination, received, block):
+    """Copy rank-major blocks of a [rows, world, columns] gather into rows.
+
+    Source rank r owns received[:, r, :block]; destination columns
+    [r * block, (r + 1) * block) receive it. Every full block is copied by
+    one strided copy, and a clipped final rank is copied separately, so the
+    total copy count per chunk is two instead of one per rank.
+    """
+    rows = destination.shape[0]
+    world = received.shape[1]
+    full = min(world, destination.shape[1] // block)
+    if full:
+        view = torch.as_strided(destination, (rows, full, block),
+                                (destination.stride(0), block, 1))
+        view.copy_(received[:, :full, :block])
+    if full < world:
+        begin = full * block
+        count = destination.shape[1] - begin
+        if count > 0:
+            destination[:, begin:begin + count].copy_(received[:, full, :count])
+
+
 class PreparedLatentShardGather:
     """Gather latent-output column partitions and FP32 router logits in chunks.
 
@@ -71,17 +93,9 @@ class PreparedLatentShardGather:
             self.send[:count, self.down_columns:].copy_(self.local_router[begin:end].view(torch.bfloat16))
             part(self.send[:count])
             received = self.received[:count].view(count, self.world, self.columns)
-            for rank in range(self.world):
-                down_begin = rank * self.down_columns
-                down_count = min(self.down_columns, self.latent.shape[1] - down_begin)
-                if down_count > 0:
-                    self.latent[begin:end, down_begin:down_begin + down_count].copy_(
-                        received[:, rank, :down_count])
-                router_begin = rank * self.router_columns
-                router_count = min(self.router_columns, self.logits.shape[1] - router_begin)
-                if router_count > 0:
-                    self.logits[begin:end, router_begin:router_begin + router_count].view(torch.bfloat16).copy_(
-                        received[:, rank, self.down_columns:self.down_columns + 2 * router_count])
+            _copy_rank_major_blocks(self.latent[begin:end], received, self.down_columns)
+            _copy_rank_major_blocks(self.logits[begin:end].view(torch.bfloat16),
+                                    received[:, :, self.down_columns:], 2 * self.router_columns)
         return self.latent
 
 
