@@ -35,6 +35,11 @@ class PreparedOwnerPacketAllReduce:
     ):
         if not isinstance(runtime, DmaAllReduce):
             raise ValueError("owner-packet reduction requires a prepared DMA ring")
+        # A ring prepared with bf16_gather=True returns BF16-representable FP32 values: each
+        # fully reduced owner chunk was rounded once with the conversion this component's final
+        # store performs and forwarded as those BF16 bits. The BF16 output is therefore
+        # bit-identical to the lossless FP32 ring, so this component needs no wire-specific
+        # branch; its final store above must remain the only rounding it applies.
         if (
             source.ndim != 2
             or source.numel() == 0

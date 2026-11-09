@@ -106,12 +106,21 @@ class PreparationConfig:
     online_mxfp8: bool = False
     # Shared experts overlap routing and routed experts on an auxiliary stream.
     stream_overlap: bool = True
+    # Prefill reduction transport. "fp32-owner-packet" is the lossless ordered FP32 copy-engine
+    # ring. "bf16-gather" runs the same ordered FP32 reduce-scatter and forwards a single BF16
+    # rounding of each fully reduced owner chunk in the all-gather phase: the serving BF16
+    # activations are bit-identical and the all-gather wire carries half the bytes.
+    prefill_reduction: str = "fp32-owner-packet"
     # Ranks share each page's context (decode context parallel over every rank, KV interleave 1).
     context_parallel: bool = True
     # The MoonViT encoder and its graphs prepare beside the text model unless the plan serves text only.
     vision: bool = True
 
     def __post_init__(self):
+        if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather"):
+            raise ValueError(
+                "prefill reduction must be fp32-owner-packet or bf16-gather"
+            )
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
             raise ValueError("Kimi draft head conversion must be mxfp8 or nvfp4")
         if self.draft_head_quantization is not None and not self.drafting:
@@ -273,7 +282,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             max_tokens=reduction_rows, hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
         prefill_collective = (create_dma_all_reduce_runtime(group, device,
             max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
-            ipc=package_storage.peer_storage, wire_mode="") if dma_prefill else
+            ipc=package_storage.peer_storage, wire_mode="",
+            bf16_gather=config.prefill_reduction == "bf16-gather") if dma_prefill else
             create_single_round_all_reduce_runtime(group, device,
                 max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
                 ipc=package_storage.peer_storage)
