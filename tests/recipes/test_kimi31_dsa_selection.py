@@ -55,6 +55,25 @@ def test_shared_selection_metadata_matches_per_layer_sequence(rows, width, world
     assert torch.equal(view.active, expected[2])
 
 
+def test_shared_buffers_keep_a_stale_tail_beyond_the_graph_rows():
+    buffers = {}
+    def metadata(rows, page):
+        return SimpleNamespace(positions=torch.arange(rows, dtype=torch.int64),
+            token_page_table=torch.full((rows, 3), page, dtype=torch.int32))
+    large = PreparedSelectionMetadata(metadata(96, 7), ContextShards.on(0, 9, "cpu"),
+                                      rows=96, device="cpu", buffers=buffers)
+    large()
+    tail = {key: value.clone() for key, value in buffers.items()}
+    small = PreparedSelectionMetadata(metadata(8, 5), ContextShards.on(0, 9, "cpu"),
+                                      rows=8, device="cpu", buffers=buffers)
+    view = small()
+    assert view.pages.shape[0] == 8 and view.lengths.shape[0] == 8 and view.active.shape[0] == 1
+    for key, value in tail.items():
+        assert torch.equal(buffers[key][view.pages.shape[0] if key == "selection_pages" else 8:],
+                           value[view.pages.shape[0] if key == "selection_pages" else 8:]), key
+    assert torch.equal(buffers["selection_pages"][:8], view.pages)
+
+
 def _construct_shared(monkeypatch, rows, world):
     def selector(query, weights, cache, pages, lengths, active, output, **kwargs):
         return SimpleNamespace(query=query, weights=weights, cache=cache, pages=pages,
