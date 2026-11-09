@@ -56,3 +56,48 @@ def test_full_chunk_workspace_sizing_is_unchanged():
 def test_packet_intervals_reject_a_scratch_that_cannot_hold_one_group():
     with pytest.raises(ValueError, match="cannot hold one aligned element group"):
         packet_intervals(72, 9, 4, 66_060_288)
+
+class _Configuration:
+    """Minimal configuration reader for the preparation setting helper."""
+
+    def __init__(self, values=None):
+        self.values = values or {}
+
+    def get(self, key, flag=None):
+        value = self.values.get(key, flag)
+
+        class _Setting:
+            pass
+
+        setting = _Setting()
+        setting.value = value
+        return setting
+
+
+def test_plan_declares_the_prefill_reduction_default():
+    from ignition import planning
+
+    fields = planning.Plan.__dataclass_fields__
+    assert fields["prefill_reduction"].default == "fp32-owner-packet"
+
+
+def test_prefill_reduction_validation_helper():
+    from ignition import planning
+    from ignition.planning import UsageError
+
+    assert planning.validate_prefill_reduction("fp32-owner-packet") == "fp32-owner-packet"
+    assert planning.validate_prefill_reduction("bf16-gather") == "bf16-gather"
+    with pytest.raises(UsageError):
+        planning.validate_prefill_reduction("fp8")
+
+
+def test_preparation_setting_reads_bf16_gather_from_configuration():
+    from ignition.cli.preparation import prefill_reduction_mode
+
+    assert prefill_reduction_mode(_Configuration(), None) == "fp32-owner-packet"
+    assert prefill_reduction_mode(
+        _Configuration({"preparation.prefill_reduction": "bf16-gather"}), None) == "bf16-gather"
+    assert prefill_reduction_mode(_Configuration(), None, "bf16-gather") == "bf16-gather"
+    with pytest.raises(Exception):
+        prefill_reduction_mode(_Configuration({"preparation.prefill_reduction": "fp8"}), None)
+

@@ -58,7 +58,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
-        prefill_reduction=getattr(plan, "prefill_reduction", "fp32-owner-packet"),
+        prefill_reduction=plan.prefill_reduction,
         vision=not plan.language_model_only, **drafting)
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)

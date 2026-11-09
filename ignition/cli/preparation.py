@@ -52,7 +52,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
            joint_tuning: bool = False, shard_hyperconnections: bool = False,
-           force_moe_decode_a16: bool | None = None) -> planning.Plan:
+           force_moe_decode_a16: bool | None = None,
+           prefill_reduction: str | None = None) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
     from ignition.preparation.collective_ladder import resolve as resolve_ladder
 
@@ -66,7 +67,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         context_parallel=context_parallel, stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
-        online_mxfp8=online_mxfp8, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
+        online_mxfp8=online_mxfp8, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode,
+        prefill_reduction=prefill_reduction_mode(configuration, model, prefill_reduction))
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
                      collective_tuning=mode, collective_ladder=ladder,
@@ -74,6 +76,18 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
                      joint_tuning=joint_tuning, shard_hyperconnections=shard_hyperconnections,
                      lock_gpu_clocks=lock_gpu_clocks, native_dense_activations=native_dense_activations)
     return tuning_devices(result, host, tuning_gpus)
+
+
+def prefill_reduction_mode(configuration, model, flag=None):
+    value = configuration.get("preparation.prefill_reduction", flag).value
+    if value is None:
+        value = "fp32-owner-packet"
+    from ignition import planning
+
+    try:
+        return planning.validate_prefill_reduction(value)
+    except planning.UsageError as error:
+        raise UsageError(str(error)) from error
 
 
 def image_capacity_setting(configuration, model, flag=None):

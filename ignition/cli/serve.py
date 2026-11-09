@@ -277,6 +277,7 @@ def _prepare(args):
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
                       image_concurrency=args.image_concurrency,
+                      prefill_reduction=args.prefill_reduction,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                          prefill_graph_capacities=args.prefill_graph_capacities,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),

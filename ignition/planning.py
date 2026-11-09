@@ -157,6 +157,19 @@ def format_gpus(indices) -> str:
     return ",".join(map(str, indices))
 
 
+PREFILL_REDUCTIONS = ("fp32-owner-packet", "bf16-gather")
+
+
+def validate_prefill_reduction(value):
+    """Reject prefill reduction transports the recipes do not define."""
+
+    if value not in PREFILL_REDUCTIONS:
+        raise UsageError(
+            "prefill reduction must be one of " + ", ".join(PREFILL_REDUCTIONS)
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class Plan:
     """Per-rank memory demand and supply for one checkpoint on selected GPUs."""
@@ -192,6 +205,9 @@ class Plan:
     shard_hyperconnections: bool = False
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
+    # Prefill reduction transport: the lossless FP32 copy-engine ring, or the same ordered
+    # FP32 reduce-scatter with a single BF16 owner rounding forwarded in the all-gather phase.
+    prefill_reduction: str = "fp32-owner-packet"
     force_moe_decode_a16: bool = False
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
@@ -208,6 +224,9 @@ class Plan:
         if (self.speculation is not None and self.speculation.draft_temperature is not None
                 and self.recipe.name not in ("kimi3", "kimi31")):
             raise UsageError("--draft-temperature requires Kimi K3 or K3.1")
+        validate_prefill_reduction(self.prefill_reduction)
+        if self.prefill_reduction != "fp32-owner-packet" and self.recipe.name not in ("kimi3", "kimi31"):
+            raise UsageError("--prefill-reduction requires Kimi K3 or K3.1")
         if self.prefill_graph_capacities is not None:
             from ignition.components.capacity import prefill_capacities
 
@@ -386,6 +405,7 @@ class Plan:
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
             "force_moe_decode_a16": self.force_moe_decode_a16,
+            "prefill_reduction": self.prefill_reduction,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
@@ -477,7 +497,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
-                mla_compute_mode=mla_compute_mode,
+                mla_compute_mode=mla_compute_mode, prefill_reduction=prefill_reduction,
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
                     if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,
@@ -536,7 +556,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False,
-         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+         language_model_only: bool = False, mla_compute_mode: str | None = None,
+         prefill_reduction: str = "fp32-owner-packet") -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
     Without `selected`, the plan uses the smallest supported tensor-parallel size
