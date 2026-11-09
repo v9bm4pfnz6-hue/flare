@@ -174,17 +174,27 @@ class PreparedSpeculativeDistributions:
         safe, live = _live(state, self.slots, self.generations, self.live_rows, self.rows)
         counts = state.histogram[safe, None, :]
         prefix = columns + self.prefix_offset
-        prefix_valid = torch.ones_like(self.valid)
-        for index in range(columns.numel() - 1 + self.prefix_offset):
-            ids = self.candidates[:, index]
-            used = index < prefix
-            valid = (ids >= 0) & (ids < state.vocab_size)
-            prefix_valid &= valid[:, None] | ~used[None, :]
-            matches = self.vocab_ids[None, None, :] == ids[:, None, None]
-            additions = matches & valid[:, None, None] & used[None, :, None]
-            counts = counts + additions.to(torch.int32)
+        # The candidate histogram is an integer count over the vocabulary: candidate i
+        # contributes one to every column whose prefix includes it, and every column
+        # requires each candidate it includes to be valid. Computing it as a sparse
+        # scatter keeps the exact integer counts while avoiding one full-vocabulary
+        # comparison pass per candidate position.
+        indices = columns.numel() - 1 + self.prefix_offset
+        used = (torch.arange(indices, device=prefix.device)[None, :] < prefix[:, None])
+        candidate_ids = self.candidates[:, :indices]
+        candidate_valid = (candidate_ids >= 0) & (candidate_ids < state.vocab_size)
+        prefix_valid = (candidate_valid[:, None, :] | ~used[None, :, :]).all(-1)
+        contributions = used[None, :, :] & candidate_valid[:, None, :]
+        positions = torch.where(contributions, candidate_ids[:, None, :],
+                                torch.zeros_like(candidate_ids)[:, None, :])
+        additions = torch.zeros((self.logits.shape[0], self.logits.shape[1], state.vocab_size),
+                                dtype=torch.float32, device=counts.device)
+        additions.scatter_add_(2, positions, contributions.to(torch.float32))
+        counts = counts + additions
         params = state.parameters[safe]
-        scores = self.logits.float()
+        # BF16 logits convert to FP32 exactly, so the score chain below runs in the
+        # same FP32 arithmetic without materializing a separate FP32 logits copy.
+        scores = self.logits
         penalty = params[:, None, 3:4]
         adjusted = torch.where(scores > 0, scores / penalty, scores * penalty)
         scores = torch.where(counts > 0, adjusted, scores)
