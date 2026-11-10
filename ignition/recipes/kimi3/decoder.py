@@ -395,7 +395,7 @@ class PreparedDecoder:
 
             shards = context.shards if context is not None else ContextShards()
             self.selection = PreparedSelectionMetadata(metadata, shards, rows=source.shape[0],
-                device=source.device, buffers=self.buffers.setdefault("dsa_selection", {}), allocator=allocator)
+                device=source.device, allocator=allocator)
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
             kind = config.layers[index]

@@ -40,7 +40,7 @@ def test_shared_selection_metadata_matches_per_layer_sequence(rows, width, world
         token_page_table=torch.randint(-1, 512, (rows, width), generator=generator, dtype=torch.int32))
     shards = ContextShards.on(rank, world, "cpu")
     buffers = {}
-    component = PreparedSelectionMetadata(metadata, shards, rows=rows, device="cpu", buffers=buffers)
+    component = PreparedSelectionMetadata(metadata, shards, rows=rows, device="cpu")
     view = component()
     expected = _per_layer_metadata(metadata, shards, rows)
     assert torch.equal(view.pages, expected[0])
@@ -55,23 +55,26 @@ def test_shared_selection_metadata_matches_per_layer_sequence(rows, width, world
     assert torch.equal(view.active, expected[2])
 
 
-def test_shared_buffers_keep_a_stale_tail_beyond_the_graph_rows():
-    buffers = {}
-    def metadata(rows, page):
+def test_hoisted_buffers_are_allocated_from_the_variant_cursor():
+    from ignition.preparation.scratch import GraphBufferPool
+
+    pool = GraphBufferPool("cpu")
+    def metadata(rows):
         return SimpleNamespace(positions=torch.arange(rows, dtype=torch.int64),
-            token_page_table=torch.full((rows, 3), page, dtype=torch.int32))
-    large = PreparedSelectionMetadata(metadata(96, 7), ContextShards.on(0, 9, "cpu"),
-                                      rows=96, device="cpu", buffers=buffers)
-    large()
-    tail = {key: value.clone() for key, value in buffers.items()}
-    small = PreparedSelectionMetadata(metadata(8, 5), ContextShards.on(0, 9, "cpu"),
-                                      rows=8, device="cpu", buffers=buffers)
-    view = small()
-    assert view.pages.shape[0] == 8 and view.lengths.shape[0] == 8 and view.active.shape[0] == 1
-    for key, value in tail.items():
-        assert torch.equal(buffers[key][view.pages.shape[0] if key == "selection_pages" else 8:],
-                           value[view.pages.shape[0] if key == "selection_pages" else 8:]), key
-    assert torch.equal(buffers["selection_pages"][:8], view.pages)
+            token_page_table=torch.zeros((rows, 3), dtype=torch.int32))
+    first = pool.cursor()
+    PreparedSelectionMetadata(metadata(24), ContextShards.on(0, 9, "cpu"),
+                              rows=24, device="cpu", allocator=first)
+    second = pool.cursor()
+    component = PreparedSelectionMetadata(metadata(6), ContextShards.on(0, 9, "cpu"),
+                                          rows=6, device="cpu", allocator=second)
+    later = second.zeros((1 << 16,), torch.int32)
+    def span(tensor):
+        return tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size()
+    later_start, later_end = span(later)
+    for tensor in (component.pages, component.lengths, component.active):
+        start, end = span(tensor)
+        assert end <= later_start or later_end <= start, "hoisted buffer overlaps this variant's later allocation"
 
 
 def _construct_shared(monkeypatch, rows, world):

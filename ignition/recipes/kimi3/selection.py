@@ -29,7 +29,7 @@ class PreparedSelectionMetadata:
     shard's visible token count, and the maximum count within each 32-row slice.
     """
 
-    def __init__(self, metadata, shards, *, rows, device, buffers, allocator=None):
+    def __init__(self, metadata, shards, *, rows, device, allocator=None):
         if rows <= 0:
             raise ValueError("shared DSA selection metadata requires query rows")
         self.metadata, self.shards, self.rows = metadata, shards, rows
@@ -38,16 +38,18 @@ class PreparedSelectionMetadata:
         self.halves = torch.arange(2, dtype=torch.int32, device=device)
         width = metadata.token_page_table.shape[1]
 
-        def allocate(key, shape, dtype):
-            existing = buffers.get(key)
-            if existing is None or existing.shape[0] < shape[0]:
-                buffers[key] = (torch.zeros(shape, dtype=dtype, device=device) if allocator is None
-                                else allocator.zeros(shape, dtype))
-            return buffers[key][:shape[0]]
+        # Allocate from this variant's own cursor. The buffers must survive the whole
+        # replay, so they cannot be cached in a dictionary shared with another graph
+        # variant: a reusing variant would not advance its cursor past them and its later
+        # allocations could land on the hoisted bytes (GraphBuffers.fork copies positions
+        # and every cursor starts from the same shared chunks).
+        def allocate(shape, dtype):
+            return (torch.zeros(shape, dtype=dtype, device=device) if allocator is None
+                    else allocator.zeros(shape, dtype))
 
-        self.pages = allocate("selection_pages", (rows, 2 * width), torch.int32)
-        self.lengths = allocate("selection_lengths", (rows,), torch.int32)
-        self.active = allocate("selection_active", (self.stages,), torch.int32)
+        self.pages = allocate((rows, 2 * width), torch.int32)
+        self.lengths = allocate((rows,), torch.int32)
+        self.active = allocate((self.stages,), torch.int32)
         self.metadata_view = SelectionMetadata(self.pages, self.lengths, self.active)
 
     def __call__(self):
