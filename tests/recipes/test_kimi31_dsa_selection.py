@@ -127,7 +127,7 @@ def _construct_shared(monkeypatch, rows, world):
 def test_layer_binds_shared_selection_slices(monkeypatch, rows, world):
     op, shared, capacity = _construct_shared(monkeypatch, rows, world)
     assert len(op.stages) == -(-rows // capacity)
-    for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired in op.stages:
+    for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired, branch in op.stages:
         stage = begin // capacity
         assert torch.equal(selector.pages, shared.pages[begin:end])
         assert torch.equal(selector.lengths, shared.lengths[begin:end])
@@ -194,3 +194,99 @@ def test_record_mapper_writes_caller_buffers(monkeypatch):
             selected, torch.zeros(2, dtype=torch.int64), torch.zeros((2, 1), dtype=torch.int32),
             world=9, rank=torch.tensor([0], dtype=torch.int64), page_size=128,
             output=torch.zeros((2, 3), dtype=torch.int32), counts=counts)
+
+
+def test_query_gather_branch_orders_after_merge_and_joins_before_attention(monkeypatch):
+    events = []
+
+    class _Stream:
+        cuda_stream = 7
+
+    class FakeArena:
+        overlap = True
+        auxiliary_stream = _Stream()
+
+    class _Selector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def write_keys(self, *args):
+            pass
+
+        def __call__(self):
+            events.append("selector")
+
+    class _Merge:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self):
+            events.append("merge")
+            return None
+
+    class _Attention:
+        def __init__(self, *args, **kwargs):
+            self.output = None
+
+        def __call__(self):
+            events.append("attention")
+
+    class _Collective:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, *args):
+            events.append("gather")
+
+    class _Combine:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, *args):
+            events.append("combine")
+
+    def records(selected, positions, pages, **kwargs):
+        events.append("records")
+        return kwargs["output"], kwargs["counts"]
+
+    def start(handle, stream, query, quantized):
+        events.append("start")
+
+    def join(dependency, stream):
+        events.append("join")
+
+    def project(*args, **kwargs):
+        class _Projection:
+            def __call__(self, source):
+                events.append("project")
+
+        return _Projection()
+
+    monkeypatch.setattr(dsa, "ScratchArena", FakeArena)
+    monkeypatch.setattr(dsa, "prepare_projection", project)
+    monkeypatch.setattr(dsa, "PreparedFP8Indexer", _Selector)
+    monkeypatch.setattr(dsa, "PreparedDistributedTopK", _Merge)
+    monkeypatch.setattr(dsa, "PreparedDenseMLA", _Attention)
+    monkeypatch.setattr(dsa, "PreparedAllGather", _Collective)
+    monkeypatch.setattr(dsa, "PreparedLseReduceScatter", _Combine)
+    monkeypatch.setattr(dsa, "selected_local_records", records)
+    monkeypatch.setattr(dsa, "_start_dsa_query_branch", start)
+    monkeypatch.setattr(dsa, "_join_dsa_query_branch", join)
+    monkeypatch.setattr(dsa.dense_mla, "Caps", lambda **kwargs: SimpleNamespace(**kwargs))
+    rows, world = 8, 2
+    context = SimpleNamespace(shards=ContextShards.on(0, world, "cpu"), candidates=object(),
+                              heads=object())
+    metadata = SimpleNamespace(positions=torch.arange(rows, dtype=torch.int64),
+        token_page_table=torch.zeros((rows, 2), dtype=torch.int32))
+    op = dsa.PreparedDSA(
+        {"index_query": None, "index_norm": torch.ones(128), "index_bias": torch.zeros(128)},
+        torch.zeros((rows, 8)), torch.zeros((rows, 128)), torch.zeros((rows, 32)),
+        torch.zeros((rows, 1, RECORD_BYTES), dtype=torch.bfloat16),
+        torch.zeros((rows, 1, 512), dtype=torch.bfloat16), torch.zeros(rows, dtype=torch.int64),
+        metadata, torch.zeros((2, 128, RECORD_BYTES), dtype=torch.float8_e4m3fn),
+        torch.zeros((4, 64 * 132), dtype=torch.uint8), context=context, session=None,
+        coordinator=None, name="attention", workspace=FakeArena(), buffers={})
+    assert op.stream_handle == 7
+    op()
+    assert "start" in events and "join" in events
+    assert events.index("merge") < events.index("start") < events.index("join") < events.index("attention")

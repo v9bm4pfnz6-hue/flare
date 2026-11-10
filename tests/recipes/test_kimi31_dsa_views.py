@@ -82,7 +82,7 @@ def _assert_view(view, expected):
 def test_stages_reuse_identical_views_and_preserve_partial_geometry(construct, rows, world):
     op, cache = construct(rows, world)
     by_count = {}
-    for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired in op.stages:
+    for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired, _branch in op.stages:
         count = end - begin
         assert paired is None
         views = (selector.pages, selector.lengths, selector.output, selector.scores,

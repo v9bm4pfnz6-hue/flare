@@ -5,6 +5,7 @@
 
 import torch
 from b12x.attention import dense_mla
+from ignition.preparation.scratch import ScratchArena
 
 from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
@@ -18,6 +19,39 @@ from .projections import prepare_projection
 # Slice selection and its cross-rank candidate exchange so prefill scratch is context-independent.
 SELECTION_ROWS = 32
 INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
+
+
+# Concurrent query-gather branches: the recipe issues the quantize plus heads-runtime
+# all-gather on the arena auxiliary stream so it overlaps the main stream's candidate
+# merge and record mapping. Only one DCP collective is in flight: the auxiliary stream
+# waits for the main stream's prior candidate exchange before it starts.
+_QUERY_BRANCHES = {}
+
+
+@torch.library.custom_op("flare::start_dsa_query_branch", mutates_args=("quantized",))
+def _start_dsa_query_branch(handle: int, stream: int, query: torch.Tensor, quantized: torch.Tensor) -> None:
+    """Run one prepared quantize+query-gather branch on the arena auxiliary stream."""
+    auxiliary = torch.cuda.ExternalStream(stream, device=query.device)
+    auxiliary.wait_stream(torch.cuda.current_stream(query.device))
+    with torch.cuda.stream(auxiliary):
+        _QUERY_BRANCHES[handle]()
+
+
+@_start_dsa_query_branch.register_fake
+def _fake_start_dsa_query_branch(handle, stream, query, quantized):
+    pass
+
+
+@torch.library.custom_op("flare::join_dsa_query_branch", mutates_args=())
+def _join_dsa_query_branch(dependency: torch.Tensor, stream: int) -> None:
+    """Order the main stream after the auxiliary query-gather branch."""
+    torch.cuda.current_stream(dependency.device).wait_stream(
+        torch.cuda.ExternalStream(stream, device=dependency.device))
+
+
+@_join_dsa_query_branch.register_fake
+def _fake_join_dsa_query_branch(dependency, stream):
+    pass
 
 
 class PreparedDSA:
@@ -90,6 +124,7 @@ class PreparedDSA:
         self.offsets = torch.arange(capacity + 1, device=device, dtype=torch.int32)
         self.page_halves = torch.arange(2, device=device, dtype=torch.int32)
         self.stages = []
+        self.stream_handle = None
         # Sequential slices and layers reuse the same selection buffers; each operator owns its binding.
         from ignition.preparation.scratch import GraphBufferPool
         if "index_workspace" not in buffers:
@@ -131,7 +166,7 @@ class PreparedDSA:
                     world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
                     session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor,
                     workspace=workspace)
-            gather = combine = paired = None
+            gather = combine = paired = branch = None
             q, attended = query[begin:end], output[begin:end]
             if self.gathered_context:
                 quantized = cursor.zeros(q.shape, torch.float8_e4m3fn)
@@ -151,6 +186,7 @@ class PreparedDSA:
                 else:
                     gather = PreparedAllGather(quantized.view(count, -1), q.view(count, -1), runtime=context.heads,
                         coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
+                    branch = self._register_query_branch(begin, end, quantized, q, gather, workspace)
                 threads, block_limit = lse_geometry(count, self.shards.world)
                 combine = PreparedLseReduceScatter(attended, lse, output[begin:end], runtime=context.heads,
                     session=session, coordinator=coordinator, name=stage_name + ".combine",
@@ -164,7 +200,25 @@ class PreparedDSA:
             attention = PreparedDenseMLA(q, cache_records, attended,
                 physical, counts, offsets, caps=caps,
                 scale=192**-.5, session=session, name=stage_name + ".sparse_attention", workspace=workspace, lse=lse)
-            self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse, paired))
+            self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse, paired,
+                branch))
+
+    def _register_query_branch(self, begin, end, quantized, gathered, gather, workspace):
+        """Register the quantize+query-gather branch when the arena offers a parallel stream."""
+        if not isinstance(workspace, ScratchArena) or not workspace.overlap:
+            return None
+        count = end - begin
+        source = self.query[begin:end]
+        destination, output = quantized.view(count, -1), gathered.view(count, -1)
+
+        def run(count=count, source=source, destination=destination, output=output, gather=gather):
+            destination.copy_(source.reshape(count, -1).float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+            gather(output)
+
+        handle = len(_QUERY_BRANCHES)
+        _QUERY_BRANCHES[handle] = run
+        self.stream_handle = workspace.auxiliary_stream.cuda_stream
+        return handle
 
     def __call__(self):
         if self.prefill is not None:
@@ -174,7 +228,7 @@ class PreparedDSA:
         self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (INDEX_DIM,),
             self.norm_weight.float(), self.norm_bias.float(), self.eps).to(self.key.dtype))
         self.stages[0][2].write_keys(self.key, self.slots)
-        for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired in self.stages:
+        for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired, branch in self.stages:
             count = end - begin
             positions, pages = m.positions[begin:end], m.token_page_table[begin:end]
             if self.selection is None:
@@ -205,10 +259,16 @@ class PreparedDSA:
                 selected_local_records(selected, positions, pages, world=shards.world,
                     rank=shards.owner, page_size=PAGE_TOKENS,
                     output=self.physical[:count], counts=self.counts[:count])
-            if quantized is not None and paired is None:
+            if branch is not None:
+                # Quantize and heads-runtime all-gather run on the arena auxiliary stream while
+                # the main stream finishes the candidate exchange and record mapping.
+                _start_dsa_query_branch(branch, self.stream_handle, self.query[begin:end], quantized)
+            elif quantized is not None and paired is None:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
-            if gather is not None:
-                gather(quantized.view(count, -1))
+                if gather is not None:
+                    gather(quantized.view(count, -1))
+            if branch is not None:
+                _join_dsa_query_branch(quantized, self.stream_handle)
             attention()
             if combine is not None:
                 combine(attention.output, lse)
