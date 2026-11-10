@@ -771,11 +771,8 @@ class PreparedRingGather:
         self.plan = pcie.plan(gather_query_from_metadata(runtime, shape=shape, dtype=dtype), runtime=runtime)
 
         def prepare(state):
-            def run():
-                state.run_gather(slots)
-                state.release_gather()
-
-            return PreparedCall(run=run, output=slots, owners=(runtime, slots))
+            # The first run loads the channel's kernels before it waits on a flag.
+            return PreparedCall(run=lambda: state.prime_gather(slots), output=slots, owners=(runtime, slots))
 
         ranks = tuple(dist.get_process_group_ranks(runtime.group))
         declare(session, (self.plan.request(name=name, prepare_call=prepare,

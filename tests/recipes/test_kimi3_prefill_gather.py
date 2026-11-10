@@ -206,6 +206,12 @@ def test_ring_gather_declares_a_plan_on_the_reduction_channel(monkeypatch):
     assert gather.slots is backing and gather.first_rank == 4
     (requests, coordinator), = declared
     assert len(requests) == 1 and coordinator == "coordinator"
+    # The preparation call primes the channel's kernels and then gathers once.
+    primed = []
+    state = type("State", (), {"prime_gather": lambda self, slots: primed.append(slots)})()
+    call = requests[0].prepare_call(state)
+    call.run()
+    assert primed == [backing] and call.output is backing
     query = gather.plan.query
     assert (query.call["operation"], query.call["shape"], query.call["dtype"]) == ("all_gather", (rows, columns), "bfloat16")
     assert (query.rank, query.world_size) == (3, WORLD)
