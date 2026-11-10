@@ -581,7 +581,7 @@ impl Metrics {
         let mut text = String::with_capacity(4096);
         text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end or through oversize or I/O errors.\n# TYPE flare_host_cache_dropped_total counter\n");
         text.push_str("# TYPE flare_host_cache_expired_total counter\n");
-        text.push_str("# HELP flare_host_cache_rows_thinned_total Rows eagerly dropped after a child commits.\n# TYPE flare_host_cache_rows_thinned_total counter\n");
+        text.push_str("# HELP flare_host_cache_rows_thinned_total Legacy eager-thinning count; child commits now retain rows for branch restoration.\n# TYPE flare_host_cache_rows_thinned_total counter\n");
         text.push_str("# HELP flare_host_cache_packed_records_total Records stored with identical rank bytes packed once.\n# TYPE flare_host_cache_packed_records_total counter\n# HELP flare_host_cache_per_rank_records_total Records stored with separate rank bytes.\n# TYPE flare_host_cache_per_rank_records_total counter\n# HELP flare_host_cache_abandoned_stores_total Stores abandoned after later rank bytes differed.\n# TYPE flare_host_cache_abandoned_stores_total counter\n");
         let _ = writeln!(
             text,

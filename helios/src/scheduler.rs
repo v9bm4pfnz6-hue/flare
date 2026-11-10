@@ -2753,9 +2753,13 @@ impl RequestScheduler {
             ready_after: request.last_use,
         };
         let history = request.history.clone();
-        // Only the last selected message can be the prompt's direct parent.
+        // Only a short tail of the last selected message can be shadowed by its
+        // own prompt. Longer message spans are offered immediately so a later
+        // branch can restore them after the prompt and terminal leave the GPU.
         let defer = matches!(capture.kind, BoundaryKind::Message)
             && request.message_boundaries.last() == Some(&(capture.consumed_tokens as usize))
+            && (capture.consumed_tokens as usize - request.prefix_tokens as usize)
+                < self.capabilities.page_tokens
             && request.prompt_tokens - (capture.consumed_tokens as usize)
                 < self.capabilities.page_tokens
             && request.plans_prompt_capture();

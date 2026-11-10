@@ -24,7 +24,7 @@
 use crate::store::TierStore;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime},
@@ -1481,8 +1481,6 @@ pub struct DiskStore {
     finishing: Vec<PrefixKey>,
     largest: u64,
     maintenance_progress: u64,
-    /// Committed children made these parents eligible for row truncation.
-    thinning: HashSet<PrefixKey>,
     pub directory_lock: record::DirectoryLock,
 }
 
@@ -1558,7 +1556,6 @@ impl DiskStore {
             finishing: Vec::new(),
             largest: scanned.iter().map(|r| r.bytes).max().unwrap_or(0),
             maintenance_progress: 0,
-            thinning: scanned.iter().filter_map(|r| r.header.parent).collect(),
             directory_lock,
         })
     }
@@ -2016,14 +2013,10 @@ impl DiskStore {
             self.used += *bytes;
             node.location.bytes = *bytes;
             node.row = node.location.header.row_present(*bytes);
-            if let Some(parent) = node.parent {
-                self.thinning.insert(parent);
-            }
         }
         if let Some(old) = self.replacements.remove(&key) {
             let node = self.index.node_mut(&key).unwrap();
             let ready = if result.is_ok() {
-                self.thinning.remove(&key);
                 self.used -= old.bytes;
                 self.stats.row_refills += 1;
                 self.stats.stored += 1;
@@ -2070,21 +2063,6 @@ impl DiskStore {
         }
         self.sync_budget();
         Ok(())
-    }
-
-    pub(crate) fn thin_rows(&mut self) {
-        for key in std::mem::take(&mut self.thinning) {
-            if !self.index.row_redundant(&key, true) || !self.index[&key].row {
-                continue;
-            }
-            let node = &self.index[&key];
-            if !node.ready || node.pinned() {
-                self.thinning.insert(key);
-            } else if self.compact(&key).is_ok() {
-                self.index.drop_row(&key);
-                self.stats.rows_thinned[1] += 1;
-            }
-        }
     }
 
     /// Evict until `bytes` more fit under the limit; false when nothing
@@ -2614,7 +2592,6 @@ impl HostStore for DiskStore {
             self.apply(event, events);
         }
         self.flush_announcements();
-        self.thin_rows();
         self.maintain();
         polled
     }
@@ -2888,7 +2865,7 @@ mod tests {
     }
 
     #[test]
-    fn eager_thinning_keeps_recovered_roots_branches_and_both_leaves() {
+    fn recovered_branches_keep_every_row_without_eager_maintenance() {
         let full = history(256);
         let headers = [
             header(&geometry(), &full, 64, None),
@@ -2902,13 +2879,13 @@ mod tests {
             .map(|(i, h)| scanned(&directory(), h.clone(), i as u64, true))
             .collect();
         let (mut store, log) = store_with(records, 1 << 30);
-        store.thin_rows();
+        store.poll(&mut Vec::new()).unwrap();
         assert!(store.index.nodes().all(|n| n.row));
         assert!(log.borrow().calls.is_empty());
     }
 
     #[test]
-    fn recovered_linear_chain_thins_and_reannounces_its_interior() {
+    fn recovered_linear_chain_preserves_every_row_for_later_branches() {
         let full = history(192);
         let headers = [
             header(&geometry(), &full, 64, None),
@@ -2932,33 +2909,19 @@ mod tests {
         assert!(log.borrow().calls.is_empty());
         store.index.unpin(&parent.key).unwrap();
         store.poll(&mut Vec::new()).unwrap();
-        assert!(store.index[&headers[0].key].row && store.index[&headers[2].key].row);
-        assert!(!store.index[&parent.key].row);
-        assert_eq!(store.stats().rows_thinned, [0, 1]);
-        assert!(matches!(
-            log.borrow().calls.as_slice(),
-            [Call::Truncate { length, .. }] if *length == parent.row_segment
-        ));
-        log.borrow_mut().events.push(TransportEvent::Truncated {
-            id: JobId(1),
-            result: Ok(()),
-        });
-        store.poll(&mut Vec::new()).unwrap();
-        let notices = announcer.take_batch(32).unwrap();
-        assert!(
-            matches!(notices.as_slice(), [crate::pool::Notice::Saved(entry)]
-            if entry.key == parent.key && !entry.row && entry.tier == PoolTier::Nvme)
-        );
-        assert!(matches!(
-            store.pin_export_files(parent.key, 0, true),
-            Err(ExportRefusal::ChainGap)
-        ));
-        store.poll(&mut Vec::new()).unwrap();
-        assert_eq!(store.stats().rows_thinned, [0, 1]);
+        assert!(store.index.nodes().all(|node| node.row));
+        assert!(log.borrow().calls.is_empty());
+        assert_eq!(store.stats().rows_thinned, [0, 0]);
+        let hit = store
+            .lookup(&full, 0, headers[2].key.consumed_tokens)
+            .unwrap();
+        assert_eq!(hit.key, parent.key);
+        assert!(store.pin_export_files(parent.key, 0, true).is_ok());
+        assert!(announcer.take_batch(32).is_none());
     }
 
     #[test]
-    fn thinning_submission_failure_rolls_back_bytes_and_preserves_poll_events() {
+    fn row_compaction_submission_failure_rolls_back_bytes_and_preserves_poll_events() {
         let full = history(192);
         let headers = [
             header(&geometry(), &full, 64, None),
@@ -2982,7 +2945,6 @@ mod tests {
                 },
             )
             .unwrap();
-        log.borrow_mut().fail_truncate = true;
         log.borrow_mut().events.push(TransportEvent::Fetched {
             id: JobId(1),
             result: Ok(hit.bytes),
@@ -2993,6 +2955,8 @@ mod tests {
             events.as_slice(),
             [StoreEvent::Fetched { result: Ok(_), .. }]
         ));
+        log.borrow_mut().fail_truncate = true;
+        assert!(store.compact(&headers[1].key).is_err());
         assert!(store.index[&headers[1].key].row);
         assert_eq!(
             store
@@ -3012,7 +2976,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_thinning_does_not_count_an_uncommitted_replacement_child() {
+    fn an_uncommitted_replacement_child_preserves_the_parent_row() {
         let full = history(192);
         let root = header(&geometry(), &full, 64, None);
         let parent = header(&geometry(), &full, 128, Some(64));
@@ -4029,16 +3993,9 @@ mod tests {
         );
         assert!(!store.index().node(&root.key).unwrap().row);
         assert_eq!(store.used(), used + ROW_RECORD);
-        // The final restore also released the interior child's row for eager truncation.
-        assert!(!store.index().node(&child.key).unwrap().row);
-        complete(
-            &log,
-            TransportEvent::Truncated {
-                id: JobId(4),
-                result: Ok(()),
-            },
-            &mut store,
-        );
+        // The final restore does not thin the interior child's row; only the
+        // explicit pressure compaction of the root removed a row above.
+        assert!(store.index().node(&child.key).unwrap().row);
         assert!(store.maintenance.is_empty());
     }
 
@@ -4155,19 +4112,13 @@ mod tests {
             },
             &mut store,
         );
-        // Committing the grandchild submits a sixth call to truncate its
-        // non-root parent's row; the root and the new leaf retain theirs.
-        assert!(matches!(
-            &log.borrow().calls[5],
-            Call::Truncate { id: JobId(6), path, length }
-                if *path == store.directory().join(record::file_name(&child.key))
-                    && *length == root_bytes - ROW_RECORD
-        ));
+        // Committing the grandchild preserves every row for a later branch.
+        assert_eq!(log.borrow().calls.len(), 5);
         assert!(store.index().node(&root.key).unwrap().row);
-        assert!(!store.index().node(&child.key).unwrap().row);
+        assert!(store.index().node(&child.key).unwrap().row);
         assert!(store.index().node(&grandchild.key).unwrap().row);
-        assert_eq!(store.used(), 2 * root_bytes + sibling_bytes - ROW_RECORD);
-        assert_eq!(store.pending_bytes(), sibling_bytes + ROW_RECORD);
+        assert_eq!(store.used(), 2 * root_bytes + sibling_bytes);
+        assert_eq!(store.pending_bytes(), sibling_bytes);
 
         // A record larger than the whole limit is skipped before anything is evicted.
         store.limit = store.used();
@@ -4184,7 +4135,7 @@ mod tests {
         assert!(2 * 4096 + 47 * PAGE_RECORD + ROW_RECORD > store.limit());
         assert_ne!(store.store(&huge).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 2);
-        assert_eq!(log.borrow().calls.len(), 6);
+        assert_eq!(log.borrow().calls.len(), 5);
         assert_eq!(store.index().len(), 3);
         assert_eq!(store.used(), store.limit());
 
@@ -4208,17 +4159,9 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(log.borrow().calls.len(), 6);
+        assert_eq!(log.borrow().calls.len(), 5);
         assert_eq!(store.index().len(), 3);
         assert!(store.index().nodes().all(|node| !node.pinned()));
-        complete(
-            &log,
-            TransportEvent::Truncated {
-                id: JobId(6),
-                result: Ok(()),
-            },
-            &mut store,
-        );
         assert_eq!(store.used(), store.limit());
         // Only the earlier sibling unlink remains charged as pending reclaim.
         assert_eq!(store.pending_bytes(), sibling_bytes);
@@ -6108,7 +6051,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_record_row_thins_recovers_and_refills() {
+    fn compact_record_row_recovers_and_refills_after_pressure() {
         let Some(directory) = test_directory("replicated", "thin-recover-refill") else {
             return;
         };
@@ -6167,6 +6110,7 @@ mod tests {
             checkpoints.push(c);
         }
         let middle = &checkpoints[1];
+        store.compact(&middle.key).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while fs::metadata(&store.record(&middle.key).unwrap().path)
             .unwrap()
@@ -6176,7 +6120,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             store.poll(&mut Vec::new()).unwrap();
         }
-        assert_eq!(store.stats().rows_thinned, [0, 1]);
+        assert_eq!(store.stats().rows_thinned, [0, 0]);
         assert_eq!(store.stats().packed_records, [0, 3]);
         store.close().unwrap();
         drop(store);
