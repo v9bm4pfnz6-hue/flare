@@ -247,11 +247,14 @@ policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
-Each tier drops a non-root record's row once its only child commits, keeping
-the pages; readers and spills delay removal until they release the row. DRAM
-releases row slots, disk truncates at the row segment, and later spills omit it.
-A rewind or later fork restores the nearest row-bearing ancestor and re-prefills
-the remaining tokens.
+Each tier retains a committed record's row for later branch restoration, not
+only the root and tip of a linear conversation. Child commit alone never drops
+or truncates a parent row. Rows are reclaimed only by the eviction policy above
+under actual capacity pressure; readers and spills delay that removal until
+they release the row. DRAM releases row slots during pressure compaction, disk
+truncates at the row segment, and later spills omit the removed row. Until such
+an eviction, a rewind or later fork restores the exact nearest row-bearing
+ancestor instead of recomputing from an older one.
 With lazy write-behind, a crash or an incomplete shutdown drain can lose the
 DRAM-only descendants of a page-only disk prefix, leaving recovery to an older
 row-bearing ancestor. Startup prunes childless page-only records and any
@@ -735,6 +738,8 @@ Offload limits interference through bounded work and explicit ownership:
 - Ticket resources belong to the scheduler until `finish_inbound`.
 - A restored endpoint's row and pages describe the same token prefix. GPU
   ancestor pages are retained, and only the missing page suffix is uploaded.
+- Committed rows remain available for later branches until capacity-pressure
+  eviction; child commit alone never removes them.
 - Rows and pages are stored byte-exact; no compression or requantization.
 - Record files are keyed by model and execution-state identity plus layout
   fingerprint; incompatible state is never restored. Each record directory
