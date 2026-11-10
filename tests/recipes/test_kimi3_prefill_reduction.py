@@ -122,3 +122,19 @@ def test_configuration_built_in_default_resolves_the_prefill_reduction():
     assert setting.value == "fp32-owner-packet"
     assert setting.source == "default"
 
+
+
+def test_debug_serve_forwards_the_prefill_reduction_into_the_plan():
+    """The diagnostic serving command must pass the transport into planning.plan.
+
+    debug-serve builds its plan directly instead of going through derive(), so a
+    flag that only reaches derive() would silently prepare the default transport.
+    """
+
+    import inspect
+
+    from ignition.cli import serve
+
+    source = inspect.getsource(serve.debug_serve)
+    assert "prefill_reduction=prefill_reduction_mode(" in source
+    assert "args.prefill_reduction" in source
