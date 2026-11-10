@@ -89,8 +89,10 @@ def test_gather_thread_tuning_keeps_other_kimi_collective_settings():
 
     assert KIMI3.b12x_environment["B12X_PCIE_DCP_THREADS"] == "512"
     assert RECIPE.b12x_environment == {**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0",
-                                       "B12X_PCIE_DCP_BLOCK_LIMIT": "64", "B12X_W4A16_PREFILL_SHAPES": "1"}
+                                       "B12X_PCIE_DCP_BLOCK_LIMIT": "64", "B12X_W4A16_PREFILL_SHAPES": "1",
+                                       "B12X_W4A16_SMALL_M_SPLITK": "decode"}
     assert "B12X_W4A16_PREFILL_SHAPES" not in KIMI3.b12x_environment
+    assert "B12X_W4A16_SMALL_M_SPLITK" not in KIMI3.b12x_environment
     assert RECIPE.b12x_environment["B12X_PCIE_DCP_BLOCK_LIMIT"] == "64"
 
 
