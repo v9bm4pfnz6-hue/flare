@@ -11,6 +11,10 @@ the router all-gather, the separate top-k, and the latent all-reduce of the gene
 Given a column-gather channel of the packed shard width, the exchange instead pushes each rank's
 packed row into its peers and every rank unpacks what it received: the paired exchange reads its
 peers' rows through their mappings, one 16-byte transaction at a time from a single block.
+
+When b12x plans the paired exchange itself as a push (one block per row writes the row into every
+peer), that exchange also selects the experts for up to eight rows and clips the padded last shard
+of a world that does not divide the widths, and it is used in place of both forms above.
 """
 
 import itertools
@@ -161,6 +165,21 @@ def create_route_runtime(group, device, *, ipc=None):
         stream_affine=False, ipc=ipc)
 
 
+def _selects_in_pushed_exchange(pcie, runtime, local_down, local_router, rows):
+    """Whether b12x plans this channel's paired exchange as a push that also selects `rows` rows' experts.
+
+    The transport is a b12x preparation setting; its plan query reports it. Only that transport runs one
+    block per row, so only it selects experts for more than one row and for padded shards.
+    """
+    query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair",
+        call=dict(local_first=local_down, local_second=local_router, threads=512))
+    if getattr(query, "call", {}).get("pair_transport") != "push":
+        return False
+    from b12x.comm.pcie.pcie_dcp_a2a import PAIR_PUSH_MAX_ROWS
+
+    return rows <= PAIR_PUSH_MAX_ROWS
+
+
 class PreparedRouteGather:
     """Gather latent and FP32 router shards into full rows, then select 16 experts per row.
 
@@ -193,7 +212,8 @@ class PreparedRouteGather:
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         requests = []
         self.fused = self.gather = None
-        if rows == 1 and self.down_width * world == 3584 and self.router_width * world == 896:
+        exact = self.down_width * world == 3584 and self.router_width * world == 896
+        if (rows == 1 and exact) or _selects_in_pushed_exchange(pcie, runtime, local_down, local_router, rows):
             self.fused = dict(local_down=local_down, local_router=local_router, correction_bias=correction_bias,
                               out_down=latent, topk_weights=weights, topk_ids=ids)
             self.plan = pcie.plan(pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair_kimi_topk",
