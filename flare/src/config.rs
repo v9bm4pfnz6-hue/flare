@@ -64,6 +64,7 @@ struct PrefixCache {
     disk_limit: Option<String>,
     drain_on_shutdown: Option<String>,
     max_age: Option<String>,
+    message_checkpoints: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -103,6 +104,11 @@ impl Configuration {
         }
         if let Some(value) = nonempty(configuration.prefix_cache.max_age.as_deref()) {
             parse_max_age(value).map_err(|error| format!("prefix_cache.max_age: {error}"))?;
+        }
+        if let Some(value) = nonempty(configuration.prefix_cache.message_checkpoints.as_deref()) {
+            if value != "every-message" && value != "coalesced" {
+                return Err("prefix_cache.message_checkpoints must be every-message or coalesced".into());
+            }
         }
         Ok(configuration)
     }
@@ -171,6 +177,10 @@ impl Configuration {
                     serving.prefix_cache_max_age = nonempty(self.prefix_cache.max_age.as_deref())
                         .map(parse_max_age)
                         .transpose()?;
+                }
+                if serving.message_checkpoints.is_none() {
+                    serving.message_checkpoints =
+                        nonempty(self.prefix_cache.message_checkpoints.as_deref()).map(str::to_owned);
                 }
                 if serving.prefix_cache_disk.is_none() {
                     serving.prefix_cache_disk = nonempty(self.paths.prefix_cache.as_deref())

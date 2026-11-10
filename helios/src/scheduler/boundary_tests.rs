@@ -821,3 +821,100 @@ fn only_the_last_selected_message_can_be_shadowed_by_the_prompt() {
         [127, 130]
     );
 }
+
+
+
+fn coalesced_policy() -> crate::scheduler::PolicyConfig {
+    crate::scheduler::PolicyConfig {
+        message_checkpoints: crate::scheduler::MessageCheckpoints::Coalesced,
+        ..Default::default()
+    }
+}
+
+fn prefill_starts(s: &mut RequestScheduler) -> (Vec<usize>, u64) {
+    let mut starts = Vec::new();
+    let mut consumed = 0u64;
+    for _ in 0..256 {
+        let Some(step) = s.plan() else { break };
+        if step.kind == GraphKind::Prefill {
+            for lane in &step.lanes {
+                starts.push(lane.start_position as usize);
+                consumed = consumed.max(lane.start_position + lane.tokens as u64);
+            }
+        }
+        let _ = run_step(s);
+    }
+    (starts, consumed)
+}
+
+fn three_small_segments(policy: Option<crate::scheduler::PolicyConfig>) -> Vec<usize> {
+    let mut s = scheduler(64, false);
+    if let Some(policy) = policy { s.configure_policy(policy).unwrap(); }
+    let mut request = spec(None, 64, 4);
+    request.message_boundaries = vec![8, 16, 24];
+    s.admit(request).unwrap();
+    prefill_starts(&mut s).0
+}
+
+#[test]
+fn coalesced_three_small_segments_run_as_one_launch() {
+    assert_eq!(three_small_segments(Some(coalesced_policy())), vec![0]);
+}
+
+#[test]
+fn every_message_keeps_the_three_small_segments() {
+    assert_eq!(three_small_segments(None), vec![0, 8, 16, 24]);
+}
+
+#[test]
+fn coalesced_tool_result_chain_has_no_dropped_boundary_launch() {
+    let mut s = scheduler(64, false);
+    s.configure_policy(coalesced_policy()).unwrap();
+    let mut request = spec(None, 2015, 4);
+    request.message_boundaries = vec![5, 2005];
+    s.admit(request).unwrap();
+    let (starts, consumed) = prefill_starts(&mut s);
+    assert_eq!(consumed, 2015);
+    assert!(!starts.contains(&5));
+    assert!(!starts.contains(&2005));
+    let mut plain = scheduler(64, false);
+    plain.configure_policy(coalesced_policy()).unwrap();
+    plain.admit(spec(None, 2015, 4)).unwrap();
+    assert_eq!(starts, prefill_starts(&mut plain).0);
+}
+
+#[test]
+fn coalesced_long_prefix_keeps_its_checkpoint_before_a_short_message() {
+    for policy in [None, Some(coalesced_policy())] {
+        let mut s = scheduler(64, false);
+        if let Some(policy) = policy { s.configure_policy(policy).unwrap(); }
+        let mut first = spec(None, 2049, 4);
+        first.message_boundaries = vec![2005, 2025];
+        s.admit(first).unwrap();
+        let (starts, consumed) = prefill_starts(&mut s);
+        assert_eq!(consumed, 2049);
+        assert!(starts.contains(&2005));
+        let mut second = spec(None, 2049, 4);
+        second.prompt = (0..2005u32).chain(9000..9044).collect();
+        second.message_boundaries = vec![2005, 2025];
+        let handle = s.admit(second).unwrap();
+        assert_eq!(s.request(handle).unwrap().consumed_tokens, 2005);
+    }
+}
+
+#[test]
+fn coalesced_shared_system_prefix_still_resumes_at_its_boundary() {
+    for policy in [None, Some(coalesced_policy())] {
+        let mut s = scheduler(64, false);
+        if let Some(policy) = policy { s.configure_policy(policy).unwrap(); }
+        let mut first = spec(None, 2600, 4);
+        first.message_boundaries = vec![2000];
+        s.admit(first).unwrap();
+        let _ = prefill_starts(&mut s);
+        let mut second = spec(None, 2600, 4);
+        second.prompt = (0..2000u32).chain(3000..3600).collect();
+        second.message_boundaries = vec![2000];
+        let handle = s.admit(second).unwrap();
+        assert_eq!(s.request(handle).unwrap().consumed_tokens, 2000);
+    }
+}

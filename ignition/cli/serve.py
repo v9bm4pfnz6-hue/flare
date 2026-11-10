@@ -61,7 +61,7 @@ def _keep_reserve(plan, usage) -> None:
 def _server_options(configuration, model, plan) -> dict:
     """Derive native server settings independently of preparation's physical KV backing."""
     recipe, checkpoint = plan.recipe, plan.checkpoint
-    return {
+    options = {
         "model_id": model.model_id, "served_names": [recipe.served_model_name],
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
@@ -71,6 +71,10 @@ def _server_options(configuration, model, plan) -> dict:
         "capacity_hint": "--max-concurrency sets the request limit; a lower [memory] reserve leaves more KV pages",
         **({"decode_weight_bytes": checkpoint.decode_weight_bytes} if checkpoint.decode_weight_bytes > 0 else {}),
     }
+    policy = configuration.get("prefix_cache.message_checkpoints").value
+    if policy:
+        options["message_checkpoints"] = policy
+    return options
 
 
 def _exhausted(error, plan) -> CapacityError | None:

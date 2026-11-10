@@ -15,7 +15,7 @@ mod sharing;
 mod utility;
 #[cfg(feature = "server")]
 pub(crate) use cost::observed_duration_ns;
-pub use policy::{PolicyConfig, RequestAccounting};
+pub use policy::{MessageCheckpoints, PolicyConfig, RequestAccounting};
 use refresh::PlanOrigin;
 pub use sharing::{EvictedCheckpoint, NextAdmission};
 pub mod speculation;
@@ -1612,8 +1612,24 @@ impl RequestScheduler {
             (self.limits.snapshots as usize / self.limits.max_active).clamp(1, 8)
         };
         let endpoints = 1 + usize::from(spec.max_new_tokens > 1 && consumed < spec.prompt.len() as u64);
+        let minimum_capacity = self
+            .prefill_catalog
+            .iter()
+            .chain(self.scored_prefill_catalog.iter())
+            .copied()
+            .min()
+            .unwrap_or(128);
+        let boundaries = match self.policy.message_checkpoints {
+            MessageCheckpoints::EveryMessage => spec.message_boundaries,
+            MessageCheckpoints::Coalesced => policy::coalesce_boundaries(
+                spec.message_boundaries,
+                consumed as usize,
+                spec.prompt.len(),
+                minimum_capacity,
+            ),
+        };
         let message_boundaries = checkpoint_boundaries(
-            spec.message_boundaries,
+            boundaries,
             consumed as usize,
             spec.prompt.len(),
             checkpoint_budget.saturating_sub(endpoints),

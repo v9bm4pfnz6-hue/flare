@@ -327,6 +327,13 @@ impl Bootstrap {
             Some(Value::String(value)) if value == "throughput" => crate::scheduler::PolicyConfig::throughput(),
             Some(_) => return Err("scheduler_policy must be balanced or throughput".into()),
         };
+        if let Some(value) = object.get("message_checkpoints") {
+            scheduling_policy.message_checkpoints = match value.as_str() {
+                Some("every-message") => crate::scheduler::MessageCheckpoints::EveryMessage,
+                Some("coalesced") => crate::scheduler::MessageCheckpoints::Coalesced,
+                _ => return Err("message_checkpoints must be every-message or coalesced".into()),
+            };
+        }
         for (name, coefficient) in [
             ("scheduler_terminal_value", &mut scheduling_policy.terminal_value),
             ("scheduler_terminal_age_price", &mut scheduling_policy.terminal_age_price),

@@ -773,6 +773,11 @@ pub struct Run {
 /// multi-host package loads with the same values.
 #[derive(Debug, Args, Clone)]
 pub struct ServingOptions {
+    /// Message-boundary checkpoints: every-message ends a prefill launch at each message boundary;
+    /// coalesced merges small messages and the generation header into one launch and keeps the
+    /// checkpoint between a long span and a short message [default: every-message].
+    #[arg(long, value_name = "POLICY", value_parser = ["every-message", "coalesced"], help_heading = "Serving options")]
+    pub message_checkpoints: Option<String>,
     /// Additional publisher verification profiles (JSON); does not grant execution trust.
     /// Development packages default to ~/.config/flare/development-publisher.json.
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]

@@ -11,8 +11,16 @@ use super::{
     *,
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MessageCheckpoints {
+    #[default]
+    EveryMessage,
+    Coalesced,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PolicyConfig {
+    pub message_checkpoints: MessageCheckpoints,
     pub output_token_value: f64,
     pub token_fairness: f64,
     pub delivery_fairness: f64,
@@ -27,6 +35,7 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
+            message_checkpoints: MessageCheckpoints::default(),
             output_token_value: 64.0,
             token_fairness: 16.0,
             delivery_fairness: 4.0,
@@ -321,22 +330,15 @@ impl RequestScheduler {
     }
 
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
-        let start = request.consumed_tokens as usize;
-        let mut end = request
-            .message_boundaries
-            .get(request.message_boundaries.partition_point(|&n| n <= start))
-            .copied()
-            .unwrap_or(request.prompt_tokens)
-            .min(start.saturating_add(capacity))
-            .min(request.prefill_limit());
-        if let Some(span) = request
-            .prefill_spans
-            .iter()
-            .find(|s| s.start < end && end < s.end)
-        {
-            end = span.start;
-        }
-        end.saturating_sub(start)
+        prefill_end(
+            &request.message_boundaries,
+            &request.prefill_spans,
+            request.consumed_tokens as usize,
+            request.prompt_tokens,
+            capacity,
+            request.prefill_limit(),
+        )
+        .saturating_sub(request.consumed_tokens as usize)
     }
 
     pub fn submission_window_available(&self, duration_ns: u64) -> bool {
@@ -1291,4 +1293,118 @@ pub(super) fn bits(mut mask: u64) -> impl Iterator<Item = usize> {
 
 pub(super) fn scratch() -> std::cell::RefCell<Vec<Candidate>> {
     std::cell::RefCell::new(Vec::new())
+}
+
+
+/// End token of one prefill launch: the next message boundary (or the prompt
+/// end), clamped by the launch capacity and the prefill limit; staged input
+/// spans clip either choice.
+pub(crate) fn prefill_end(
+    message_boundaries: &[usize],
+    prefill_spans: &[std::ops::Range<usize>],
+    start: usize,
+    prompt_tokens: usize,
+    capacity: usize,
+    prefill_limit: usize,
+) -> usize {
+    let mut end = message_boundaries
+        .get(message_boundaries.partition_point(|&n| n <= start))
+        .copied()
+        .unwrap_or(prompt_tokens)
+        .min(start.saturating_add(capacity))
+        .min(prefill_limit);
+    if let Some(span) = prefill_spans.iter().find(|s| s.start < end && end < s.end) {
+        end = span.start;
+    }
+    end
+}
+
+/// A span of this many smallest prefill capacities keeps the checkpoint at its
+/// end when only a short message follows it.
+const LONG_SPAN_CAPACITIES: usize = 8;
+
+/// Coalesced message checkpoints. With m the smallest prefill capacity, a
+/// boundary is kept when the span since the previous kept boundary (or the
+/// resume point) holds at least m tokens and either at least m tokens follow
+/// it before the prompt end, or the span holds at least LONG_SPAN_CAPACITIES * m
+/// tokens and the boundary does not close the last complete message. Dropped
+/// boundaries make their segment continue into the next launch.
+///
+/// The span condition merges runs of small messages into one launch. The tail
+/// condition lets the open generation header share the launch of the message
+/// before it: only that header follows the last boundary, and the prompt
+/// capture at the prompt end serves the requests that continue from there.
+/// The long-span clause keeps the checkpoint that later requests resume from
+/// when they share a long prefix, such as system instructions and tool
+/// declarations, and differ in a short message after it; recomputing such a
+/// span costs more than the one small launch that merging the short message
+/// saves.
+pub(crate) fn coalesce_boundaries(
+    boundaries: Vec<usize>,
+    start: usize,
+    prompt_tokens: usize,
+    m: usize,
+) -> Vec<usize> {
+    let long_span = m.saturating_mul(LONG_SPAN_CAPACITIES);
+    let last = boundaries
+        .iter()
+        .copied()
+        .filter(|&boundary| start < boundary && boundary < prompt_tokens)
+        .max();
+    let mut kept = Vec::new();
+    let mut previous = start;
+    for boundary in boundaries {
+        if boundary <= previous || boundary >= prompt_tokens {
+            continue;
+        }
+        let span = boundary - previous;
+        let tail = prompt_tokens - boundary;
+        let closes_last_message = Some(boundary) == last;
+        if span >= m && (tail >= m || (span >= long_span && !closes_last_message)) {
+            kept.push(boundary);
+            previous = boundary;
+        }
+    }
+    kept
+}
+
+#[cfg(test)]
+mod message_checkpoint_boundary_tests {
+    use super::{coalesce_boundaries, prefill_end};
+
+    #[test]
+    fn prefill_end_stops_at_next_boundary_capacity_or_prompt_end() {
+        let boundaries = [3usize, 7];
+        assert_eq!(prefill_end(&boundaries, &[], 0, 8, 64, 8), 3);
+        assert_eq!(prefill_end(&boundaries, &[], 3, 8, 64, 8), 7);
+        assert_eq!(prefill_end(&boundaries, &[], 7, 8, 64, 8), 8);
+        assert_eq!(prefill_end(&[], &[], 0, 64, 16, 64), 16);
+        assert_eq!(prefill_end(&[], &[], 0, 64, 64, 5), 5);
+        let spans = [4usize..10];
+        assert_eq!(prefill_end(&[], &spans, 0, 8, 64, 8), 4);
+    }
+
+    #[test]
+    fn coalesce_merges_small_segments_and_short_tails() {
+        assert_eq!(coalesce_boundaries(vec![8, 16, 24], 0, 64, 128), Vec::<usize>::new());
+        assert_eq!(coalesce_boundaries(vec![2000], 0, 2600, 128), vec![2000]);
+        assert_eq!(coalesce_boundaries(vec![100, 300, 350], 0, 1000, 128), vec![300]);
+        // The generation header shares the launch of the last message, whatever its length.
+        assert_eq!(coalesce_boundaries(vec![300], 0, 324, 128), Vec::<usize>::new());
+        assert_eq!(coalesce_boundaries(vec![2005], 0, 2015, 128), Vec::<usize>::new());
+        assert_eq!(coalesce_boundaries(vec![5, 2005], 0, 2015, 128), Vec::<usize>::new());
+        assert_eq!(coalesce_boundaries(vec![1300, 1340], 1000, 1364, 128), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn coalesce_keeps_the_checkpoint_between_a_long_span_and_a_short_message() {
+        // System instructions, a short user message, the generation header.
+        assert_eq!(coalesce_boundaries(vec![2000, 2020], 0, 2044, 128), vec![2000]);
+        // The clause needs LONG_SPAN_CAPACITIES capacities in the span.
+        assert_eq!(coalesce_boundaries(vec![2024, 2040], 1000, 2064, 128), vec![2024]);
+        assert_eq!(coalesce_boundaries(vec![2023, 2040], 1000, 2064, 128), Vec::<usize>::new());
+        // The span is measured from the previous kept boundary.
+        assert_eq!(coalesce_boundaries(vec![2005, 2100, 3100, 3110], 0, 3134, 128), vec![2005, 3100]);
+        assert_eq!(coalesce_boundaries(vec![2005, 2100, 2900, 2910], 0, 2934, 128), vec![2005]);
+    }
 }
