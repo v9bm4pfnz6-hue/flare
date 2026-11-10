@@ -23,6 +23,8 @@ pub(crate) mod decoded_history;
 mod rounds;
 #[cfg(test)]
 mod valuation;
+#[cfg(test)]
+mod forecast_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -683,6 +685,7 @@ pub struct RequestScheduler {
     forecasts: rounds::Forecasts,
     costs: cost::ActionCosts,
     refresh: refresh::RefreshState,
+    acceptance_prior: speculation::DeploymentAcceptance,
     tickets: HashMap<PrefixKey, Ticket>,
     track_publications: bool,
     publications: Vec<CheckpointId>,
@@ -736,6 +739,8 @@ impl RequestScheduler {
             capabilities.page_tokens,
         )?;
         let forecasts = rounds::Forecasts::new(capabilities.completion_token_capacity);
+        let acceptance_prior =
+            speculation::DeploymentAcceptance::new(capabilities.completion_token_capacity);
         Ok(Self {
             plan_owner: Arc::new(()),
             limits,
@@ -773,6 +778,7 @@ impl RequestScheduler {
             forecasts,
             costs: cost::ActionCosts::default(),
             refresh: refresh::RefreshState::default(),
+            acceptance_prior,
             tickets: HashMap::new(),
             track_publications: false,
             publications: Vec::new(),
@@ -1613,6 +1619,10 @@ impl RequestScheduler {
             checkpoint_budget.saturating_sub(endpoints),
         );
         self.slots[slot].generation = generation;
+        let mut acceptance = speculation::AcceptanceProfile::new(
+            self.capabilities.completion_token_capacity);
+        acceptance.seed_means(self.proposal_source,
+            self.acceptance_prior.means(self.proposal_source));
         self.slots[slot].request = Some(LiveRequest {
             image_slot: None,
             conditioned_features: None,
@@ -1622,7 +1632,7 @@ impl RequestScheduler {
             window_snapshot_ready: false,
             window_restore: false,
             epoch: 0,
-            acceptance: speculation::AcceptanceProfile::new(self.capabilities.completion_token_capacity),
+            acceptance,
             accounting: self.accounting(),
             handle,
             state_slot: StateSlotId((1 + slot * execution_rows) as u32),
@@ -2467,6 +2477,7 @@ impl RequestScheduler {
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
+        let mut acceptance_observations: Vec<(usize, usize, bool, Option<Vec<f32>>)> = Vec::new();
         let mut useful_tokens = [0u64; REQUEST_LANES];
         let mut generated = Vec::new();
         let mut boundaries = Vec::new();
@@ -2521,14 +2532,19 @@ impl RequestScheduler {
             {
                 let vector = record.vector.as_ref().unwrap();
                 let offered = vector.offered_drafts as usize;
+                let accepted = vector.accepted_drafts as usize;
+                let rejected = vector.emitted_count > vector.accepted_drafts;
+                let branch_survival = survival
+                    .map(|rows| rows[lane.request.slot as usize].clone());
                 request.acceptance.observe(
                     proposal_source,
                     record.generated_tokens as u32,
                     offered,
-                    vector.accepted_drafts as usize,
-                    vector.emitted_count > vector.accepted_drafts,
-                    survival.map(|rows| rows[lane.request.slot as usize].as_slice()),
+                    accepted,
+                    rejected,
+                    branch_survival.as_deref(),
                 );
+                acceptance_observations.push((offered, accepted, rejected, branch_survival));
             }
             if record.status == 3 {
                 request.error_code = Some(record.error_code);
@@ -2625,6 +2641,10 @@ impl RequestScheduler {
             if request.pending == 0 {
                 request.scheduled_consumed = request.consumed_tokens;
             }
+        }
+        for (offered, accepted, rejected, branch_survival) in acceptance_observations {
+            self.acceptance_prior.observe(proposal_source, offered, accepted, rejected,
+                branch_survival.as_deref());
         }
         for lane in &step.lanes {
             let pending = self.pending_token_ceiling(lane.request) as u64;
