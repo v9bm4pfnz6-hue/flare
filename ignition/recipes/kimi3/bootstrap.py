@@ -375,12 +375,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                            query_head_dim=RECORD_BYTES, ipc=package_storage.peer_storage),
                 coordinator=coordinator,
                 peers=pool.share_pages(package_storage, group), slab=None,
-                candidates=(create_all_gather_runtime(group, device, max_rows=selection_rows,
-                    columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None),
                 prefill_layout="query_split" if sparse else "dcp",
                 index_peers=pool.share_pages(package_storage, group, suffix=".index") if sparse else None,
+                # Prefill gathers selected positions on this channel, and decode and verification the candidate
+                # scores of their rows: 2 * TOPK BF16 columns per rank either way.
                 selections=(create_all_gather_runtime(group, device,
-                    max_rows=min(32, (config.prefill_chunk_size + shard.world_size - 1) // shard.world_size),
+                    max_rows=max(selection_rows,
+                                 min(32, (config.prefill_chunk_size + shard.world_size - 1) // shard.world_size)),
                     columns=2 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
             from ignition.components.weights import OutputPartitionedBF16Weight
             if any(isinstance(layer["attention"].get("index_query"), OutputPartitionedBF16Weight)

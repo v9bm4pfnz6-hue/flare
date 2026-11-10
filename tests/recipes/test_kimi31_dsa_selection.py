@@ -83,7 +83,8 @@ def _construct_shared(monkeypatch, rows, world):
             lengths=lengths, active=active, output=output, scores=kwargs["scores"])
 
     def merge(indices, scores, output, **kwargs):
-        return SimpleNamespace(indices=indices, scores=scores, output=output)
+        return SimpleNamespace(indices=indices, scores=scores, output=output, runtime=kwargs["runtime"],
+                               name=kwargs["name"])
 
     def attention(query, cache, output, pages, lengths, starts, **kwargs):
         return SimpleNamespace(query=query, cache=cache, output=output, pages=pages,
@@ -97,7 +98,7 @@ def _construct_shared(monkeypatch, rows, world):
 
     monkeypatch.setattr(dsa, "prepare_projection", lambda *args, **kwargs: None)
     monkeypatch.setattr(dsa, "PreparedFP8Indexer", selector)
-    monkeypatch.setattr(dsa, "PreparedDistributedTopK", merge)
+    monkeypatch.setattr(dsa, "PreparedScoreExchangeTopK", merge)
     monkeypatch.setattr(dsa, "PreparedDenseMLA", attention)
     monkeypatch.setattr(dsa, "PreparedAllGather", collective)
     monkeypatch.setattr(dsa, "PreparedLseReduceScatter", combine)
@@ -111,7 +112,7 @@ def _construct_shared(monkeypatch, rows, world):
         lengths=torch.zeros((rows,), dtype=torch.int32),
         active=torch.zeros((-(-rows // selection_rows),), dtype=torch.int32))
     context = None if world == 1 else SimpleNamespace(
-        shards=ContextShards.on(0, world, "cpu"), candidates=object(), heads=object())
+        shards=ContextShards.on(0, world, "cpu"), selections=SELECTIONS, heads=object())
     op = dsa.PreparedDSA(
         {"index_query": None, "index_norm": torch.ones(128), "index_bias": torch.zeros(128)},
         torch.zeros((rows, 8)), torch.zeros((rows, 128)), torch.zeros((rows, 32)),
@@ -123,6 +124,9 @@ def _construct_shared(monkeypatch, rows, world):
     return op, shared, capacity
 
 
+SELECTIONS = object()
+
+
 @pytest.mark.parametrize("rows,world", [(8, 9), (33, 9), (96, 9), (8, 1)])
 def test_layer_binds_shared_selection_slices(monkeypatch, rows, world):
     op, shared, capacity = _construct_shared(monkeypatch, rows, world)
@@ -132,6 +136,12 @@ def test_layer_binds_shared_selection_slices(monkeypatch, rows, world):
         assert torch.equal(selector.pages, shared.pages[begin:end])
         assert torch.equal(selector.lengths, shared.lengths[begin:end])
         assert torch.equal(selector.active, shared.active[stage:stage + 1])
+        if world == 1:
+            assert merge is None
+        else:
+            # Decode rows exchange candidate scores on the channel that gathers 2 * k BF16 columns per rank.
+            assert merge.runtime is SELECTIONS and merge.name == f"attention.rows{begin}.candidate_scores"
+            assert merge.output.shape == (end - begin, dsa.TOPK)
 
 
 def _pack_candidates_emulation(arguments, metadata):
@@ -265,7 +275,7 @@ def test_query_gather_branch_orders_after_merge_and_joins_before_attention(monke
     monkeypatch.setattr(dsa, "ScratchArena", FakeArena)
     monkeypatch.setattr(dsa, "prepare_projection", project)
     monkeypatch.setattr(dsa, "PreparedFP8Indexer", _Selector)
-    monkeypatch.setattr(dsa, "PreparedDistributedTopK", _Merge)
+    monkeypatch.setattr(dsa, "PreparedScoreExchangeTopK", _Merge)
     monkeypatch.setattr(dsa, "PreparedDenseMLA", _Attention)
     monkeypatch.setattr(dsa, "PreparedAllGather", _Collective)
     monkeypatch.setattr(dsa, "PreparedLseReduceScatter", _Combine)
@@ -274,7 +284,7 @@ def test_query_gather_branch_orders_after_merge_and_joins_before_attention(monke
     monkeypatch.setattr(dsa, "_join_dsa_query_branch", join)
     monkeypatch.setattr(dsa.dense_mla, "Caps", lambda **kwargs: SimpleNamespace(**kwargs))
     rows, world = 8, 2
-    context = SimpleNamespace(shards=ContextShards.on(0, world, "cpu"), candidates=object(),
+    context = SimpleNamespace(shards=ContextShards.on(0, world, "cpu"), selections=object(),
                               heads=object())
     metadata = SimpleNamespace(positions=torch.arange(rows, dtype=torch.int64),
         token_page_table=torch.zeros((rows, 2), dtype=torch.int32))

@@ -54,12 +54,13 @@ def _rank(rank, rendezvous, world, records):
     mapping = metadata.page_table.long()[:, logical // (128 * world)] * (128 * world) + logical % (128 * world)
     with PackageStorage(rank=rank, world=world, device=rank) as storage:
         coordinator = CollectivePreparation(dist.group.WORLD)
-        candidates = create_all_gather_runtime(dist.group.WORLD, device, max_rows=rows,
-            columns=4 * 2048 * world, ipc=storage.peer_storage)
+        # Decode rows exchange one FP32 score per candidate slot: 2 * 2048 BF16 columns per rank.
+        selections = create_all_gather_runtime(dist.group.WORLD, device, max_rows=rows,
+            columns=2 * 2048 * world, ipc=storage.peer_storage)
         exchange = create_head_exchange(dist.group.WORLD, device, max_rows=rows, heads=heads,
             head_dim=512, query_head_dim=576, ipc=storage.peer_storage)
         context = ContextParallel(ContextShards.on(rank, world, device), exchange, coordinator, {}, None,
-                                  candidates=candidates)
+                                  selections=selections)
         with RecordedPreparationSession(device=device, checkpoint=f"kimi-dsa-tp{world}", workload_schema="dsa-global-top2048",
                 numerical_policy="fp8", coordinator=coordinator, compile_workers=4 * world) as session:
             arena, pool = ScratchArena(device), GraphBufferPool(device)
@@ -109,7 +110,7 @@ def _rank(rank, rendezvous, world, records):
                     cutoff = scores[:, :length].topk(2048, dim=1).values[:, -1]
                     assert (actual_scores.amin(1) >= cutoff - 1e-3).all()
             graph.reset()
-        candidates.close()
+        selections.close()
         exchange.close()
     dist.destroy_process_group()
 
