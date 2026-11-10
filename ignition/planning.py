@@ -467,8 +467,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         if (speculation.method is not None and speculation.method != default_method
                 and speculation.method not in recipe.speculative_methods):
             raise UsageError(f"--speculative-method {speculation.method}: {checkpoint.alias} does not prepare this proposal method")
-        if speculation.block_verification and recipe.name != "kimi3":
-            raise ValueError("token-wise block verification is prepared only by Kimi K3")
+        if speculation.block_verification and recipe.name not in ("kimi3", "kimi31"):
+            raise ValueError("token-wise block verification is prepared only by Kimi K3 and K3.1")
         if speculation.vocabulary_parallel_sampling and recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
         if speculation.vocabulary_parallel_sampling and len(gpus) == 3:
