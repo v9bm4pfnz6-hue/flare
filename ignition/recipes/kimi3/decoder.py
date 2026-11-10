@@ -188,7 +188,7 @@ class PreparedMLP:
 class PreparedLatentMoE:
     def __init__(self, weights, source, config, shard, *, runtime, router_runtime, coordinator, session, name, workspace, buffers, storage,
                  route_runtime=None, prefill_route_runtime=None, allocator=None, accumulation_buffers=None,
-                 reduction_staging=None):
+                 reduction_staging=None, route_gather_runtime=None):
         tokens, hidden = source.shape
         c, device = config.text, source.device
         latent = c["routed_expert_hidden_size"]
@@ -235,7 +235,8 @@ class PreparedLatentMoE:
             self.route_gather = PreparedRouteGather(self.down.output, local_logits, weights["correction"],
                 self.latent, routes.weights, routes.ids, runtime=route_runtime, session=session,
                 coordinator=coordinator, name=name + ".route_gather",
-                buffers=buffers.setdefault("route_gather_transport", {}), allocator=allocator)
+                buffers=buffers.setdefault("route_gather_transport", {}), allocator=allocator,
+                gather_runtime=route_gather_runtime)
         else:
             logits = buffer("router", c["num_experts"], torch.float32)
             self.router_logits = logits
@@ -431,6 +432,8 @@ class PreparedDecoder:
                 mlp = PreparedLatentMoE(w, source, config, weights.shard, runtime=runtime,
                     router_runtime=router_runtime, route_runtime=route_runtime if mode != "prefill" else None,
                     prefill_route_runtime=prefill_route_runtime if mode == "prefill" else None,
+                    # Decode rows push their packed shards through the channel prefill chunks gather on.
+                    route_gather_runtime=prefill_route_runtime if mode != "prefill" else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace,
                     buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=buffers.stage_allocator("moe"),
                     accumulation_buffers=accumulation_buffers, reduction_staging=reduction_staging)

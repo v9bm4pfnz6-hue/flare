@@ -260,6 +260,91 @@ def test_tp9_route_gather_declares_all_speculative_rows(monkeypatch, rows):
         assert getattr(gather, field).untyped_storage().data_ptr() == getattr(largest, field).untyped_storage().data_ptr()
 
 
+@pytest.mark.parametrize("rows", (1, 4, 32))
+def test_tp9_route_gather_pushes_packed_shards_through_a_column_channel(monkeypatch, rows):
+    import torch
+    from types import SimpleNamespace
+    from b12x.comm import pcie
+    from ignition.components import collectives
+    from ignition.preparation.scratch import GraphBufferPool
+    from ignition.recipes.kimi3 import routing
+    from ignition.recipes.kimi3.config import padded_width
+
+    down_width = padded_width(3584, 9, 32)
+    router_width = padded_width(896, 9, 8)
+    columns = down_width + 2 * router_width
+    runtime = SimpleNamespace(world_size=9, query_head_dim=2 * down_width + 4 * router_width,
+                              exchange_group=object())
+    channel = SimpleNamespace(world_size=9, heads_per_rank=1, query_head_dim=columns, max_batch_size=1024)
+    declared, gathers = [], []
+    plan = SimpleNamespace(request=lambda **kwargs: kwargs["name"])
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: tuple(range(9)))
+    monkeypatch.setattr(pcie, "query_from_runtime", lambda runtime, **kwargs: kwargs)
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: plan)
+    monkeypatch.setattr(routing, "declare", lambda session, requests, **kwargs: declared.extend(requests))
+
+    class Gather:
+        def __init__(self, source, output, *, runtime, session, coordinator, name):
+            gathers.append((tuple(source.shape), tuple(output.shape), source.dtype, runtime, name))
+
+    monkeypatch.setattr(collectives, "PreparedAllGather", Gather)
+
+    def make(count, buffers, allocator, **kwargs):
+        return routing.PreparedRouteGather(
+            torch.zeros((count, down_width), dtype=torch.bfloat16),
+            torch.zeros((count, router_width), dtype=torch.float32), torch.zeros(896, dtype=torch.float32),
+            torch.zeros((count, 3584), dtype=torch.bfloat16), torch.zeros((count, 16), dtype=torch.float32),
+            torch.zeros((count, 16), dtype=torch.int32), runtime=runtime, session=None, coordinator=None,
+            name=f"route-{count}", buffers=buffers, allocator=allocator, **kwargs)
+
+    pool = GraphBufferPool("cpu", chunk_bytes=256)
+    buffers = {}
+    largest = make(32, buffers, pool.cursor(), gather_runtime=channel)
+    nbytes = pool.nbytes
+    del declared[:], gathers[:]
+    gather = make(rows, buffers, pool.cursor(), gather_runtime=channel)
+
+    # The channel carries the exchange; only the local selection is declared with the route runtime.
+    assert gather.fused is None and declared == [f"route-{rows}/select"]
+    assert gathers == [((rows, columns), (rows, 9 * columns), torch.bfloat16, channel, f"route-{rows}/gather")]
+    assert gather.send.shape == (rows, columns) and gather.received.shape == (rows, 9 * columns)
+    assert gather.logits.shape == (rows, 896) and not hasattr(gather, "gathered_latent")
+    assert pool.nbytes == nbytes
+    for field in ("logits", "send", "received"):
+        assert getattr(gather, field).untyped_storage().data_ptr() == getattr(largest, field).untyped_storage().data_ptr()
+    for wrong in (dict(heads_per_rank=2), dict(query_head_dim=columns + 8), dict(world_size=8),
+                  dict(max_batch_size=rows - 1)):
+        with pytest.raises(ValueError, match="column channel"):
+            make(rows, {}, None, gather_runtime=SimpleNamespace(**{**vars(channel), **wrong}))
+
+
+def test_route_unpack_geometry_matches_rank_major_compaction():
+    """The index arithmetic of the unpack kernel, replayed on the CPU against the paired path's compaction."""
+    import torch
+    from ignition.recipes.kimi3.config import padded_width
+
+    for world, rows in ((9, 1), (9, 6), (9, 32), (12, 4)):
+        down, router = padded_width(3584, world, 32), 2 * padded_width(896, world, 8)
+        generator = torch.Generator().manual_seed(world * 131 + rows)
+        local_down = torch.randint(-32768, 32768, (world, rows, down), generator=generator, dtype=torch.int16)
+        local_router = torch.randint(-32768, 32768, (world, rows, router), generator=generator, dtype=torch.int16)
+        # What the column gather delivers: every rank's packed row, rank-major.
+        received = torch.cat([torch.cat((local_down[rank], local_router[rank]), dim=1) for rank in range(world)], dim=1)
+        latent = torch.full((rows, 3584), -1, dtype=torch.int16)
+        logits = torch.full((rows, 2 * 896), -1, dtype=torch.int16)
+        column = torch.arange(512)
+        for row in range(rows):
+            for rank in range(world):
+                source = received[row, rank * (down + router):]
+                live = (column < down) & (rank * down + column < latent.shape[1])
+                latent[row, rank * down + column[live]] = source[column[live]]
+                live = (column < router) & (rank * router + column < logits.shape[1])
+                logits[row, rank * router + column[live]] = source[down + column[live]]
+        # The paired exchange gathers each field rank-major and keeps its logical prefix.
+        assert torch.equal(latent, torch.cat(tuple(local_down), dim=1)[:, :3584])
+        assert torch.equal(logits, torch.cat(tuple(local_router), dim=1)[:, :2 * 896])
+
+
 def test_tp9_route_gather_rejects_rows_above_capacity():
     import torch
     from types import SimpleNamespace
