@@ -92,7 +92,7 @@ def test_gather_thread_tuning_keeps_other_kimi_collective_settings():
                                        "B12X_PCIE_DCP_BLOCK_LIMIT": "64", "B12X_W4A16_PREFILL_SHAPES": "1",
                                        "B12X_W4A16_SMALL_M_SPLITK": "decode",
                                        "B12X_PCIE_DCP_PAIR_PUSH": "1", "B12X_PCIE_DCP_GATHER_ACQUIRE": "1",
-                                       "B12X_PCIE_DCP_GATHER_ISLAND": "2", "B12X_PCIE_DCP_LSE_PUSH_TP9": "1",
+                                       "B12X_PCIE_DCP_GATHER_ISLAND": "2", "B12X_PCIE_DCP_LSE_PUSH_TP9": "2",
                                        "B12X_TRELLIS_SWITCH_SCOPE": "decode", "B12X_TRELLIS_LUT_CP_ASYNC": "2",
                                        "B12X_TRELLIS_PREFETCH_SIDES": "1", "B12X_TRELLIS_INKERNEL_ROUTE_PACK": "2",
                                        "B12X_TRELLIS_FLOW_FLAGS": "1", "B12X_TRELLIS_TILE_CONFIG": "128,128,64,256",

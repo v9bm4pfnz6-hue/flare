@@ -52,7 +52,9 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
     # (4,5), (6,7) and 8): the paired route exchange pushes one block per row and selects the experts in
     # the same launch; head gathers cross once between ranks 0-3,8 and ranks 4-7, which share a single
     # link, and are forwarded in two more phases (b12x side_entry_gather_roles), with acquire-flag
-    # barriers; the LSE reduce-scatter pushes each destination's heads. All are byte-for-byte transports.
+    # barriers; the LSE reduce-scatter pushes each destination's heads, and between ranks 0-3 and ranks 4-7
+    # a rank sends the rank across one LSE-weighted FP32 partial of its quad instead of four rows
+    # (b12x lse_quad_roles; FP32 sums group differently). The other transports are byte for byte.
     # Expert launches of fewer than 128 tokens stage their table with cp.async, prefetch the rotation
     # side tables, pack routes inside the kernel and replace two grid barriers with per-block counters
     # (same arithmetic), and use the 128,128,64,256 tile (FP32 sums over K group differently).
@@ -61,7 +63,7 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
                                        "B12X_PCIE_DCP_BLOCK_LIMIT": "64", "B12X_W4A16_PREFILL_SHAPES": "1",
                                        "B12X_W4A16_SMALL_M_SPLITK": "decode",
                                        "B12X_PCIE_DCP_PAIR_PUSH": "1", "B12X_PCIE_DCP_GATHER_ACQUIRE": "1",
-                                       "B12X_PCIE_DCP_GATHER_ISLAND": "2", "B12X_PCIE_DCP_LSE_PUSH_TP9": "1",
+                                       "B12X_PCIE_DCP_GATHER_ISLAND": "2", "B12X_PCIE_DCP_LSE_PUSH_TP9": "2",
                                        "B12X_TRELLIS_SWITCH_SCOPE": "decode", "B12X_TRELLIS_LUT_CP_ASYNC": "2",
                                        "B12X_TRELLIS_PREFETCH_SIDES": "1", "B12X_TRELLIS_INKERNEL_ROUTE_PACK": "2",
                                        "B12X_TRELLIS_FLOW_FLAGS": "1", "B12X_TRELLIS_TILE_CONFIG": "128,128,64,256",
