@@ -42,8 +42,11 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
     # Gather threads are tuned independently; the attention components declare LSE's 512-thread geometry.
     # The TP9 gather reaches peak at the kernel's 64-block ceiling: measured 28.87 ms against 31.96 ms
     # at the inherited eight-block limit for 4608 rows, and 6.41 ms against 7.06 ms at 1024 rows.
+    # The EXL3 expert kernel takes the measured prefill launch shapes: at TP9 the 128-row graph runs in
+    # 0.232 s against 0.299 s, the 256-row graph in 0.351 s against 0.464 s and the 512-row graph in
+    # 0.558 s against 0.659 s; launches below 128 rows and the 2,048-row graph keep the heuristic plan.
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0",
-                                       "B12X_PCIE_DCP_BLOCK_LIMIT": "64"}),
+                                       "B12X_PCIE_DCP_BLOCK_LIMIT": "64", "B12X_W4A16_PREFILL_SHAPES": "1"}),
     ranks=MappingProxyType({8: RankCosts(state_row_bytes=63_181_056, page_bytes=2_543_616,
                                        graph_bytes=9 << 29, page_tokens=128 * 8),
                            9: RankCosts(state_row_bytes=58_129_152, page_bytes=2_543_616,
