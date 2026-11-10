@@ -43,6 +43,62 @@ def packet_intervals(elements, world, workspace_elements, max_bytes):
     return extent, tuple(intervals)
 
 
+def copy_engine_reduction(source, output, *, runtime, workspace, staging, session, coordinator, name):
+    """The prepared reduction of a copy-engine channel for one BF16 matrix.
+
+    A tree channel reduces BF16 directly; a ring channel reduces FP32 owner packets in `workspace`.
+    """
+    if getattr(runtime, "tree", None) is not None:
+        return PreparedTreeAllReduce(source, output, staging=staging, runtime=runtime, session=session,
+                                     coordinator=coordinator, name=name)
+    return PreparedOwnerPacketAllReduce(source, output, workspace=workspace, staging=staging, runtime=runtime,
+                                        session=session, coordinator=coordinator, name=name)
+
+
+class PreparedTreeAllReduce:
+    """BF16 reduction routed over the ranks' PCIe switch tree on the copy engines.
+
+    The channel sums BF16 values in FP32 and rounds once at each chunk's owner, so this component
+    adds no promotion and no rounding of its own. A payload whose element count is not a multiple
+    of `world * 8` is reduced in caller-owned padded staging; the tail beyond the payload is
+    reduced with it and never read. Input and output may be exact aliases or disjoint. Calls
+    sharing the channel serialize.
+    """
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name, staging=None):
+        if not isinstance(runtime, DmaAllReduce) or getattr(runtime, "tree", None) is None:
+            raise ValueError("a tree reduction requires a copy-engine channel prepared with a tree topology")
+        if (source.ndim != 2 or source.numel() == 0 or source.dtype != torch.bfloat16
+                or output.shape != source.shape or output.dtype != source.dtype
+                or source.device != output.device or not source.is_contiguous() or not output.is_contiguous()):
+            raise ValueError("a tree reduction requires matching contiguous BF16 matrices")
+        world, elements = runtime.world_size, source.numel()
+        extent = aligned_extent(elements, world)
+        self.output, self.elements, self.padded = output, elements, None
+        if extent * world == elements:
+            self.reduce = PreparedAllReduce(source, output, runtime=runtime, session=session,
+                                            coordinator=coordinator, name=name + ".tree")
+            return
+        if (staging is None or staging.device != source.device or staging.dtype != source.dtype
+                or not staging.is_contiguous() or staging.numel() < extent * world):
+            raise ValueError("unaligned tree reductions require caller-owned padded BF16 staging")
+        # Staging is shared by graphs of several shapes, so the tail may hold what an earlier
+        # reduction left there. Every rank holds the same values, and only the payload is copied out.
+        self.padded = staging[: extent * world]
+        packet = self.padded.view(world, extent)
+        self.reduce = PreparedAllReduce(packet, packet, runtime=runtime, session=session,
+                                        coordinator=coordinator, name=name + ".tree")
+        self.packet = packet
+
+    def __call__(self, source):
+        if self.padded is None:
+            return self.reduce(source)
+        self.padded[: self.elements].copy_(source.view(-1))
+        self.reduce(self.packet)
+        self.output.view(-1).copy_(self.padded[: self.elements])
+        return self.output
+
+
 class PreparedOwnerPacketAllReduce:
     """Promote, reduce in place, and round once without a full-sized FP32 copy.
 

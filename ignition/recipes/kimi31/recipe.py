@@ -48,9 +48,23 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
     # Decode launches of that kernel use the stripe split-K schedule: at TP9 a speculative round at equal
     # offered drafts takes 0.85 ms less of about 33 ms. Its finalize adds FP32 partial sums in lock order,
     # so decode rounds are not run-to-run reproducible; prefill launches keep whole-tile scheduling.
+    # Collectives of a nine-rank deployment on four leaf pairs and one single rank (ranks (0,1), (2,3),
+    # (4,5), (6,7) and 8): the paired route exchange pushes one block per row and selects the experts in
+    # the same launch; head gathers enter a pair once and are forwarded inside it, with acquire-flag
+    # barriers; the LSE reduce-scatter pushes each destination's heads. All are byte-for-byte transports.
+    # Expert launches of fewer than 128 tokens stage their table with cp.async, prefetch the rotation
+    # side tables, pack routes inside the kernel and replace two grid barriers with per-block counters
+    # (same arithmetic), and use the 128,128,64,256 tile (FP32 sums over K group differently).
+    # The 2,048-row prefill graph takes the direct decode table with 48-row blocks (regroups FP32 sums).
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0",
                                        "B12X_PCIE_DCP_BLOCK_LIMIT": "64", "B12X_W4A16_PREFILL_SHAPES": "1",
-                                       "B12X_W4A16_SMALL_M_SPLITK": "decode"}),
+                                       "B12X_W4A16_SMALL_M_SPLITK": "decode",
+                                       "B12X_PCIE_DCP_PAIR_PUSH": "1", "B12X_PCIE_DCP_GATHER_ACQUIRE": "1",
+                                       "B12X_PCIE_DCP_GATHER_ISLAND": "1", "B12X_PCIE_DCP_LSE_PUSH_TP9": "1",
+                                       "B12X_TRELLIS_SWITCH_SCOPE": "decode", "B12X_TRELLIS_LUT_CP_ASYNC": "2",
+                                       "B12X_TRELLIS_PREFETCH_SIDES": "1", "B12X_TRELLIS_INKERNEL_ROUTE_PACK": "2",
+                                       "B12X_TRELLIS_FLOW_FLAGS": "1", "B12X_TRELLIS_TILE_CONFIG": "128,128,64,256",
+                                       "B12X_W4A16_PREFILL_TABLE": "1"}),
     ranks=MappingProxyType({8: RankCosts(state_row_bytes=63_181_056, page_bytes=2_543_616,
                                        graph_bytes=9 << 29, page_tokens=128 * 8),
                            9: RankCosts(state_row_bytes=58_129_152, page_bytes=2_543_616,

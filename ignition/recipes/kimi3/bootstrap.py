@@ -117,6 +117,10 @@ class PreparationConfig:
     # ring. "bf16-gather" runs the same ordered FP32 reduce-scatter and forwards a single BF16
     # rounding of each fully reduced owner chunk in the all-gather phase: the serving BF16
     # activations are bit-identical and the all-gather wire carries half the bytes.
+    # "tree-2+2+2+2+1" routes the reduction over the PCIe switch tree of nine ranks on four leaf
+    # pairs and one single rank: BF16 values to the rank that sums them, FP32 partial sums to the
+    # owner, one BF16 rounding per owner. Same arithmetic precision; the FP32 additions group
+    # by leaf instead of by ring order, so results are not bit-identical to the ring's.
     prefill_reduction: str = "fp32-owner-packet"
     # Ranks share each page's context (decode context parallel over every rank, KV interleave 1).
     context_parallel: bool = True
@@ -124,9 +128,9 @@ class PreparationConfig:
     vision: bool = True
 
     def __post_init__(self):
-        if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather"):
+        if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather", "tree-2+2+2+2+1"):
             raise ValueError(
-                "prefill reduction must be fp32-owner-packet or bf16-gather"
+                "prefill reduction must be fp32-owner-packet, bf16-gather or tree-2+2+2+2+1"
             )
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
             raise ValueError("Kimi draft head conversion must be mxfp8 or nvfp4")
@@ -294,7 +298,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         prefill_collective = (create_dma_all_reduce_runtime(group, device,
             max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
             ipc=package_storage.peer_storage, wire_mode="",
-            bf16_gather=config.prefill_reduction == "bf16-gather") if dma_prefill else
+            bf16_gather=config.prefill_reduction == "bf16-gather",
+            tree=(config.prefill_reduction.removeprefix("tree-")
+                  if config.prefill_reduction.startswith("tree-") else None)) if dma_prefill else
             create_single_round_all_reduce_runtime(group, device,
                 max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
                 ipc=package_storage.peer_storage)

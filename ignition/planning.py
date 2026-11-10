@@ -157,7 +157,7 @@ def format_gpus(indices) -> str:
     return ",".join(map(str, indices))
 
 
-PREFILL_REDUCTIONS = ("fp32-owner-packet", "bf16-gather")
+PREFILL_REDUCTIONS = ("fp32-owner-packet", "bf16-gather", "tree-2+2+2+2+1")
 
 
 def validate_prefill_reduction(value):

@@ -118,12 +118,16 @@ def create_result_broadcast_runtime(group, device, *, layouts, ipc=None):
 
 
 def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
-                                 wire_mode=None, bf16_gather=False):
+                                 wire_mode=None, bf16_gather=False, tree=None):
     """Allocate a b12x copy-engine ring for prefill reductions in caller-owned shared storage.
 
     bf16_gather keeps the ring's ordered FP32 reduce-scatter and forwards a single
     BF16 rounding of every fully reduced owner chunk in the all-gather phase; the
     caller's BF16 store then observes the identical bits with half the gather wire.
+
+    tree names a PCIe switch-tree topology of the ranks (b12x.comm.pcie._dma_tree). The channel
+    then reduces BF16 tensors directly: BF16 values travel to the rank that sums them, FP32
+    partial sums to each chunk's owner, and the owner's one BF16 rounding to every rank.
     """
     from b12x.comm.pcie import DmaAllReduce
 
@@ -133,8 +137,10 @@ def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc
         raise ValueError("all-reduce storage must use two- or four-byte elements")
     if type(bf16_gather) is not bool or bf16_gather and element_bytes != 2:
         raise ValueError("BF16 gather requires a two-byte activation declaration")
+    if tree is not None and (type(tree) is not str or not tree or bf16_gather or element_bytes != 2):
+        raise ValueError("a tree reduction names its topology and takes BF16 activations without the ring's gather")
     return DmaAllReduce(exchange_group=group, device=device, max_bytes=max_tokens * hidden_size * element_bytes,
-                        ipc=ipc, fp8=wire_mode, bf16_gather=bf16_gather)
+                        ipc=ipc, fp8=wire_mode, bf16_gather=bf16_gather, **({} if tree is None else {"tree": tree}))
 
 
 def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head_dim=None, ipc=None):

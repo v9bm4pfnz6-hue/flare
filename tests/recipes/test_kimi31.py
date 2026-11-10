@@ -90,7 +90,15 @@ def test_gather_thread_tuning_keeps_other_kimi_collective_settings():
     assert KIMI3.b12x_environment["B12X_PCIE_DCP_THREADS"] == "512"
     assert RECIPE.b12x_environment == {**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0",
                                        "B12X_PCIE_DCP_BLOCK_LIMIT": "64", "B12X_W4A16_PREFILL_SHAPES": "1",
-                                       "B12X_W4A16_SMALL_M_SPLITK": "decode"}
+                                       "B12X_W4A16_SMALL_M_SPLITK": "decode",
+                                       "B12X_PCIE_DCP_PAIR_PUSH": "1", "B12X_PCIE_DCP_GATHER_ACQUIRE": "1",
+                                       "B12X_PCIE_DCP_GATHER_ISLAND": "1", "B12X_PCIE_DCP_LSE_PUSH_TP9": "1",
+                                       "B12X_TRELLIS_SWITCH_SCOPE": "decode", "B12X_TRELLIS_LUT_CP_ASYNC": "2",
+                                       "B12X_TRELLIS_PREFETCH_SIDES": "1", "B12X_TRELLIS_INKERNEL_ROUTE_PACK": "2",
+                                       "B12X_TRELLIS_FLOW_FLAGS": "1", "B12X_TRELLIS_TILE_CONFIG": "128,128,64,256",
+                                       "B12X_W4A16_PREFILL_TABLE": "1"}
+    assert not any(name.startswith(("B12X_TRELLIS", "B12X_PCIE_DCP_PAIR", "B12X_PCIE_DCP_GATHER", "B12X_PCIE_DCP_LSE"))
+                   for name in KIMI3.b12x_environment)
     assert "B12X_W4A16_PREFILL_SHAPES" not in KIMI3.b12x_environment
     assert "B12X_W4A16_SMALL_M_SPLITK" not in KIMI3.b12x_environment
     assert RECIPE.b12x_environment["B12X_PCIE_DCP_BLOCK_LIMIT"] == "64"
