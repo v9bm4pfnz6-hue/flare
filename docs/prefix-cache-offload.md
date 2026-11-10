@@ -171,14 +171,18 @@ pub trait HostStore {
 ```
 
 The worker calls `store` for each offered checkpoint, without waiting for GPU
-pressure. The scheduler defers a message checkpoint whose own planned prompt
-checkpoint is its direct child less than one physical page later, and terminal
-checkpoints, until a request resumes at that exact checkpoint. A preempted
-terminal counts as resumed. If its prompt capture cannot obtain a snapshot, the
-message is offered while the request still pins it; cancellation or error before
-that capture offers it at retirement. GPU captures, prefill cuts, and retention
-are unchanged; deferred points can be lost to GPU
-eviction before reuse, and are not announced to the pool until offered.
+pressure. The scheduler defers a message checkpoint only when it covers less
+than one physical page of new tokens since its parent and its own planned prompt
+checkpoint is its direct child less than one physical page later. Longer message
+spans are offered immediately, so a later session can restore a long system
+prefix after the first request's prompt and terminal endpoints leave the GPU.
+Terminal checkpoints are deferred until a request resumes at that exact
+checkpoint. A preempted terminal counts as resumed. If a deferred message's
+prompt capture cannot obtain a snapshot, the message is offered while the
+request still pins it; cancellation or error before that capture offers it at
+retirement. GPU captures, prefill cuts, and retention are unchanged; deferred
+points can be lost to GPU eviction before reuse, and are not announced to the
+pool until offered.
 Compaction also offers a deferred branch point as its heir and refreshes
 descendant offers with their new parent.
 `Queued` holds one GPU pin until `Stored` or `Deferred`; `Present`
