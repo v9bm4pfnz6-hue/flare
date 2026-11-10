@@ -61,15 +61,21 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 REDUCE_ROWS = 1024
 
 
-# The copy-engine ring wins above roughly a megabyte of payload: measured on nine GPUs at 7168
-# columns, a 9-row reduction costs 0.170 ms on the ring against 0.089 ms hierarchical, while
-# 128 rows costs 0.345 ms against 0.882 ms. Smaller prefill graphs keep the hierarchical channel
-# because the ring's fixed round trip dominates below one megabyte.
-DMA_PREFILL_MIN_BYTES = 1 << 20
+# World 9 reduces a prefill graph of up to this many rows through the direct channel and a
+# larger one through the copy-engine ring. The ring's sixteen sequential hops have a fixed cost
+# that dominates small payloads; a direct reduction of 7168 columns takes 0.38 ms at 128 rows
+# and 0.77 ms at 256. Measured on complete launches: 128 rows 0.232 s on the ring and 0.222 s
+# direct; 256 rows 0.351 s on the ring and 0.376 s direct.
+DIRECT_PREFILL_MAX_ROWS = 128
 
 
 def _prefill_uses_dma(world_size, rows, hidden):
     return world_size == 9 and (rows * hidden) % (world_size * 8) == 0
+
+
+def _prefill_reduces_on_ring(capacity):
+    """Whether a world-9 prefill graph of this capacity reduces on the copy-engine ring."""
+    return capacity > DIRECT_PREFILL_MAX_ROWS
 
 
 @dataclass(frozen=True)
@@ -279,6 +285,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         reduction_rows = config.decode_tokens if shard.world_size in SUPPORTED_WORLD_SIZES else channel_rows
         if shard.world_size == 9 and not dma_prefill:
             reduction_rows = config.prefill_chunk_size
+        elif dma_prefill:
+            # The direct channel also carries the prefill graphs that stay off the ring.
+            reduction_rows = max([reduction_rows, *(capacity for capacity in config.prefill_graph_capacities
+                                                    if not _prefill_reduces_on_ring(capacity))])
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=reduction_rows, hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
         prefill_collective = (create_dma_all_reduce_runtime(group, device,
@@ -518,7 +528,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     prefill_runtime = (prefill_collective if mode == "prefill"
                                        and prefill_collective is not None
                                        and (capacity == config.prefill_chunk_size if not dma_prefill
-                                            else capacity * weights.config.hidden * 2 >= DMA_PREFILL_MIN_BYTES)
+                                            else _prefill_reduces_on_ring(capacity))
                                        else collective)
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,

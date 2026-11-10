@@ -364,6 +364,13 @@ def test_tp9_dma_prefill_requires_aligned_ring_shards():
     assert config.prefill_graph_capacities == (128, 4608)
 
 
+def test_tp9_small_prefill_graphs_reduce_on_the_direct_channel():
+    from ignition.recipes.kimi3.bootstrap import DIRECT_PREFILL_MAX_ROWS, _prefill_reduces_on_ring
+
+    assert DIRECT_PREFILL_MAX_ROWS == 128
+    assert [capacity for capacity in (128, 256, 512, 1024, 2048, 4608) if not _prefill_reduces_on_ring(capacity)] == [128]
+
+
 def test_tp9_lse_geometry_uses_measured_rows():
     from ignition.recipes.kimi3.dcp import lse_geometry
 
