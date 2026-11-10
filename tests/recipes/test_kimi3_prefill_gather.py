@@ -176,3 +176,50 @@ def test_command_line_takes_the_prefill_gather_and_both_plan_builders_receive_it
     assert inspect.signature(preparation.derive).parameters["prefill_gather"].default is None
     source = inspect.getsource(serve.debug_serve)
     assert "prefill_gather=prefill_gather_mode(" in source and "args.prefill_gather" in source
+
+
+def test_ring_gather_declares_a_plan_on_the_reduction_channel(monkeypatch):
+    """The gather's plan is built from the channel a reduction uses, with the operation and segment in its query."""
+    import torch.distributed as dist
+    from b12x.comm.pcie import DmaAllReduce
+    from b12x.comm.pcie._dma_preparation import query_from_metadata
+
+    from ignition.components import collectives
+
+    rows, columns = 512, 624
+    runtime = DmaAllReduce.__new__(DmaAllReduce)
+    runtime.world_size, runtime.rank, runtime.device = WORLD, 3, torch.device("cuda", 3)
+    runtime.max_bytes = 4608 * 7168 * 2
+    runtime.shard_capacity = runtime.max_bytes // WORLD
+    runtime._fp8, runtime._bf16_gather, runtime._pieces_override, runtime._a2a_chunks_override = "", True, 0, 0
+    runtime._fp8_stage, runtime._fp8_stage_stride = None, 0
+    runtime._bf16_stage = torch.zeros(64, dtype=torch.uint8)
+    runtime._tree, runtime._closed, runtime.group = None, False, object()
+    backing = torch.zeros((WORLD, rows, columns), dtype=torch.bfloat16)
+    monkeypatch.setattr(DmaAllReduce, "gather_slots", lambda self, shape, dtype: backing)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: list(range(WORLD)))
+    declared = []
+    monkeypatch.setattr(collectives, "declare",
+                        lambda session, requests, coordinator=None: declared.append((requests, coordinator)))
+    gather = collectives.PreparedRingGather((rows, columns), torch.bfloat16, runtime=runtime, session=None,
+                                            coordinator="coordinator", name="layer1.moe.ring")
+    assert gather.slots is backing and gather.first_rank == 4
+    (requests, coordinator), = declared
+    assert len(requests) == 1 and coordinator == "coordinator"
+    query = gather.plan.query
+    assert (query.call["operation"], query.call["shape"], query.call["dtype"]) == ("all_gather", (rows, columns), "bfloat16")
+    assert (query.rank, query.world_size) == (3, WORLD)
+    # The same channel declares a reduction with the same channel facts and storage.
+    reduction = query_from_metadata(runtime, shape=(WORLD * 8, 64), dtype=torch.bfloat16)
+    for key in ("max_bytes", "wire_mode", "bf16_gather", "pieces_override", "a2a_chunks_override"):
+        assert query.call[key] == reduction.call[key]
+    assert dict(query.setup) == dict(reduction.setup)
+    # A segment larger than a shard of the channel is not a gather of this channel.
+    with pytest.raises(ValueError, match="shard capacity"):
+        collectives.PreparedRingGather((4608, 7168), torch.bfloat16, runtime=runtime, session=None,
+                                       coordinator=None, name="too-large")
+    tree = DmaAllReduce.__new__(DmaAllReduce)
+    tree._tree, tree.shard_capacity = object(), runtime.shard_capacity
+    with pytest.raises(ValueError, match="ring channel"):
+        collectives.PreparedRingGather((rows, columns), torch.bfloat16, runtime=tree, session=None,
+                                       coordinator=None, name="tree")
