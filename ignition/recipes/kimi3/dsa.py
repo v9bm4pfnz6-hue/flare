@@ -213,7 +213,7 @@ class PreparedDSA:
 
         def run(count=count, source=source, destination=destination, output=output, gather=gather):
             destination.copy_(source.reshape(count, -1).float().clamp(-448., 448.).to(torch.float8_e4m3fn))
-            gather(output)
+            gather(destination)
 
         handle = len(_QUERY_BRANCHES)
         _QUERY_BRANCHES[handle] = run
