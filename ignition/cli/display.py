@@ -33,6 +33,7 @@ def speculation(settings, *, brief: bool = False) -> str:
     drafts = settings.draft_tokens
     depth = f"{'up to' if settings.adaptive else 'exactly'} {drafts} draft token{'' if drafts == 1 else 's'}"
     parallel = " · vocabulary-parallel block sampling" if settings.vocabulary_parallel_sampling else ""
+    parallel += " · token-wise block verification" if settings.block_verification else ""
     selection = " · GPU prefix selection" if settings.draft_prefix_selection == "gpu" else ""
     heads = [f"{head} head {getattr(settings, head + '_head_quantization').upper()}"
              for head in ("draft", "markov") if getattr(settings, head + '_head_quantization') is not None]

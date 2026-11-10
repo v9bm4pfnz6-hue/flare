@@ -36,7 +36,8 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
                         speculative_token_capacity=plan.speculative_token_capacity,
                         speculative_graph_budget=plan.speculation.graph_budget or 64,
                         draft_head_quantization=plan.speculation.draft_head_quantization,
-                        draft_temperature=plan.speculation.draft_temperature or 1.)
+                        draft_temperature=plan.speculation.draft_temperature or 1.,
+                        block_verification=plan.speculation.block_verification)
         directory = draft_directory or DRAFT_DIRECTORY
         if (Path(snapshot) / directory).is_dir():
             drafting["draft_checkpoint"] = str(Path(snapshot) / directory)

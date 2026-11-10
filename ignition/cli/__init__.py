@@ -210,6 +210,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--vocabulary-parallel-sampling", action="store_true",
                           help="prepare vocabulary-sharded DSpark proposals and block rejection sampling"
                                " (DeepSeek V4.1; default: full-vocabulary sampling)")
+    advanced.add_argument("--block-verification", action="store_true",
+                          help="prepare token-wise block rejection verification instead of chain verification"
+                               " (Kimi K3; default: chain verification)")
     advanced.add_argument("--mla-compute-mode", choices=("auto", "bf16"),
                           help="constrain MLA arithmetic while retaining packed KV storage and compatible"
                                " kernel tuning (default: see MODEL --help)")

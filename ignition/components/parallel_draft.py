@@ -14,6 +14,7 @@ from .speculation import (
     DRAFT_RNG_DOMAIN,
     PreparedSpeculativeCommit,
     PreparedSpeculativeDistributions,
+    PreparedStochasticBlockVerification,
     PreparedStochasticVerification,
 )
 from .state import save_hidden
@@ -285,7 +286,9 @@ class PreparedParallelDraftRound:
                                         result_runtime=getattr(o, "result_runtime", None))
             self.operations = None, proposals, None, None
             return
-        verify = PreparedStochasticVerification(
+        verifier = (PreparedStochasticBlockVerification if getattr(o, "block_verification", False)
+                    else PreparedStochasticVerification)
+        verify = verifier(
             self.probabilities,
             self.drafts,
             target.probabilities,

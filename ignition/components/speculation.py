@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ignition.components.flashinfer_sampling import filter_probabilities_out, probability_filter_workspace, verify_chain
+from ignition.components.flashinfer_sampling import filter_probabilities_out, sample_probabilities, probability_filter_workspace, verify_chain
 
 from ignition.components.capacity import BATCH_CAPACITIES
 from ignition.components.completion import VECTOR_TOKENS_FIELD, validate_completion_buffers
@@ -354,6 +354,13 @@ class PreparedStochasticVerification:
         self.safe_ids.copy_(torch.where(valid[:, None], ids, 0))
         self.seed_bits.copy_(self.state.seed.view(torch.int64)[safe] ^ TARGET_RNG_DOMAIN)
         self.offset.copy_(torch.where(self.rng.generation[safe] == self.generations, self.rng.target_offset[safe], 0))
+        self._verify(valid)
+        if self.broadcast is not None:
+            self.broadcast()
+        return out
+
+    def _verify(self, valid):
+        out = self.output
         self.independent_accepted.zero_()
         self.emitted_drafts.zero_()
         tokens, _, _ = verify_chain(self.safe_draft_probs, self.safe_ids, self.safe_target_probs,
@@ -382,9 +389,85 @@ class PreparedStochasticVerification:
                 prefixes.append(prefixes[-1] * ratio[:, depth])
             out.survival.fill_(-1.)
             out.survival[:, :self.drafts.shape[1]].copy_(torch.where(valid[:, None], torch.stack(prefixes, -1), -1.))
-        if self.broadcast is not None:
-            self.broadcast()
-        return out
+
+
+class PreparedStochasticBlockVerification(PreparedStochasticVerification):
+    """Block rejection sampling over full-vocabulary probabilities on one rank.
+
+    r_0=1 and r_(i+1)=min(r_i*p_i(x_i)/q_i(x_i),1) in the log domain, so a zero
+    prefix stays zero. Correction mass d_i(x)=max(r_i*p_i(x)-q_i(x),0). The
+    decision after draft i uses h_i=sum(d_(i+1))/(sum(d_(i+1))+1-r_(i+1)) when
+    another offered draft follows and h_i=r_(i+1) at the last one. Decisions are
+    all drawn: the last success selects the prefix, and stopping at the first
+    failure would implement a different algorithm. The correction comes from
+    d_n, or from p at the bonus position. Zero d_n can only arise from FP32 mass
+    rounding and falls back to p.
+
+    Every draw is a request-domain one-row library call, so tokens do not depend
+    on the batch slot: decision i is subsequence i at the round's offset and the
+    correction is subsequence zero at offset+1, inside the base reservation.
+    Published survival is the running minimum of r, a non-increasing lower bound
+    of P(prefix accepted | drafts) that the scheduler's forecast can validate.
+    """
+
+    def _verify(self, valid):
+        out, depth = self.output, self.drafts.shape[1]
+        target, draft = self.safe_target_probs, self.safe_draft_probs
+        batch, vocab = target.shape[0], target.shape[2]
+        if self.token_limits is None:
+            out.offered_drafts.fill_(depth)
+        else:
+            out.offered_drafts.copy_((self.token_limits - 1).clamp(0, depth))
+        offered = out.offered_drafts.long()
+        if depth:
+            ids = self.safe_ids.long()
+            q = draft.gather(-1, ids[:, :, None]).squeeze(-1)
+            p = target[:, :-1].gather(-1, ids[:, :, None]).squeeze(-1)
+            steps = torch.where(q > 0, p.log() - q.log(), torch.where(p > 0, 0., -torch.inf))
+            logs = [torch.zeros_like(steps[:, 0])]
+            for column in range(depth):
+                logs.append((logs[-1] + steps[:, column]).clamp(max=0.))
+            scales = torch.stack(logs, -1)
+            excess = (scales[:, :-1, None].exp() * target[:, :-1] - draft).clamp(min=0.)
+            mass = excess.sum(-1, dtype=torch.float64)
+            following = torch.cat((mass[:, 1:], torch.zeros_like(mass[:, :1])), -1)
+            total = following - scales[:, 1:].double().expm1()
+            block = torch.where(total > 0, following / total, 1.).float()
+            positions = self.columns[None, :-1] + 1
+            successes = torch.where(positions < offered[:, None], block,
+                                    torch.where(positions == offered[:, None], scales[:, 1:].exp(), 0.)).clamp(0., 1.)
+            outcomes = torch.stack((1. - successes, successes), -1)
+            accepted = torch.stack([sample_probabilities(outcomes[row], self.seed_bits[row].repeat(depth),
+                                                         self.offset[row].repeat(depth))
+                                    for row in range(batch)]).long()
+            accepted = (accepted * positions).amax(-1)
+            drafted = excess.gather(1, accepted.clamp(max=depth - 1)[:, None, None].expand(-1, 1, vocab)).squeeze(1)
+            drafted_mass = mass.gather(1, accepted.clamp(max=depth - 1)[:, None]).float()
+            correct = (accepted < offered) & (drafted_mass[:, 0] > 0)
+        else:
+            accepted = offered
+        bonus = target.gather(1, accepted[:, None, None].expand(-1, 1, vocab)).squeeze(1)
+        bonus = bonus / bonus.sum(-1, keepdim=True)
+        residual = torch.where(correct[:, None], drafted / drafted_mass.clamp(min=torch.finfo(torch.float32).tiny),
+                               bonus) if depth else bonus
+        correction = torch.cat([sample_probabilities(residual[row:row + 1], self.seed_bits[row:row + 1],
+                                                     self.offset[row:row + 1] + 1)
+                                for row in range(batch)]).long()
+        tokens = correction[:, None].expand(-1, self.columns.numel())
+        if depth:
+            tokens = torch.where(self.columns[None] < accepted[:, None],
+                                 torch.cat((self.safe_ids.long(), correction[:, None]), -1), tokens)
+        out.token_ids.copy_(torch.where(self.columns[None] <= accepted[:, None], tokens, -1))
+        out.accepted_drafts.copy_(torch.where(valid, accepted, 0))
+        out.proposed_count.copy_(torch.where(valid, accepted + 1, 0))
+        out.rng_increment.copy_(torch.where(valid, self.draw_reservation, 0))
+        out.token_ids.masked_fill_(~valid[:, None], -1)
+        if depth:
+            prefixes = [scales[:, 1].exp()]
+            for column in range(1, depth):
+                prefixes.append(torch.minimum(prefixes[-1], scales[:, column + 1].exp()))
+            out.survival.fill_(-1.)
+            out.survival[:, :depth].copy_(torch.where(valid[:, None], torch.stack(prefixes, -1), -1.))
 
 
 class PreparedSpeculativeStateCommit:

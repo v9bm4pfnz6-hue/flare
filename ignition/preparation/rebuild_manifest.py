@@ -244,6 +244,8 @@ def from_plan(model, plan, *, compiled_forwards):
             vocabulary_parallel_sampling=s.vocabulary_parallel_sampling)
         if s.method is not None:
             result['speculation']['method'] = s.method
+        if s.block_verification:
+            result['speculation']['block_verification'] = True
         if s.packed_verification and s.draft_tokens > 0 and s.graph_budget is None:
             raise ValueError('packed speculative rebuild metadata requires an explicit graph budget')
         if s.graph_budget is not None:

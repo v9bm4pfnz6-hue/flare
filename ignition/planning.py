@@ -419,6 +419,7 @@ class Plan:
                 "draft_head_quantization": self.speculation.draft_head_quantization,
                 "markov_head_quantization": self.speculation.markov_head_quantization,
                 "vocabulary_parallel_sampling": self.speculation.vocabulary_parallel_sampling,
+                **({"block_verification": True} if self.speculation.block_verification else {}),
                 **({"graph_budget": self.speculation.graph_budget}
                    if self.speculation.graph_budget is not None else {})},
             "benchmark_selection": None if self.benchmark_selection is None else self.benchmark_selection.to_dict(),
@@ -466,6 +467,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         if (speculation.method is not None and speculation.method != default_method
                 and speculation.method not in recipe.speculative_methods):
             raise UsageError(f"--speculative-method {speculation.method}: {checkpoint.alias} does not prepare this proposal method")
+        if speculation.block_verification and recipe.name != "kimi3":
+            raise ValueError("token-wise block verification is prepared only by Kimi K3")
         if speculation.vocabulary_parallel_sampling and recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
         if speculation.vocabulary_parallel_sampling and len(gpus) == 3:
