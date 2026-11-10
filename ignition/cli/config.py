@@ -24,7 +24,8 @@ _SECTIONS = {
                  "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str},
     "memory": {"reserve": str},
     "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool, "prefill_reduction": str},
-    "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str},
+    "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str,
+                     "message_checkpoints": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "package_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
 }
@@ -42,6 +43,7 @@ _BUILT_IN = {
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
     "preparation.prefill_reduction": "fp32-owner-packet",
     "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.drain_on_shutdown": "", "prefix_cache.max_age": "off",
+    "prefix_cache.message_checkpoints": "",
     "paths.hub_cache": "~/.cache/huggingface/hub", "paths.kernel_cache": "~/.cache/flare/kernels",
     "paths.package_cache": "~/.cache/flare/packages",
     "paths.export_staging": "",
@@ -49,6 +51,7 @@ _BUILT_IN = {
     "paths.cuda": "",
 }
 AUTOTUNE_EFFORTS = ("off", "default", "audit")
+MESSAGE_CHECKPOINTS = ("every-message", "coalesced")
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:([KMGT])(?:iB|B)?)?", re.IGNORECASE)
 
 
@@ -118,6 +121,8 @@ class Configuration:
                     seconds = 0
                 if not 0.5e-9 < seconds < 2**63:
                     raise UsageError(f'prefix_cache {key} {text!r} must be {"on, " if key == "drain_on_shutdown" else ""}off, or a positive duration such as 90s or 2m')
+            if key == "message_checkpoints" and value not in MESSAGE_CHECKPOINTS:
+                raise UsageError(f"{path}: message_checkpoints must be one of {', '.join(MESSAGE_CHECKPOINTS)}")
             if key == "autotune_effort" and value not in AUTOTUNE_EFFORTS:
                 raise UsageError(f"{path}: autotune_effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
             if key == "prefill_reduction" and value not in ("fp32-owner-packet", "bf16-gather"):

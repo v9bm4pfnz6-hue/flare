@@ -61,7 +61,7 @@ def _keep_reserve(plan, usage) -> None:
 def _server_options(configuration, model, plan) -> dict:
     """Derive native server settings independently of preparation's physical KV backing."""
     recipe, checkpoint = plan.recipe, plan.checkpoint
-    options = {
+    return {
         "model_id": model.model_id, "served_names": [recipe.served_model_name],
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
@@ -71,10 +71,6 @@ def _server_options(configuration, model, plan) -> dict:
         "capacity_hint": "--max-concurrency sets the request limit; a lower [memory] reserve leaves more KV pages",
         **({"decode_weight_bytes": checkpoint.decode_weight_bytes} if checkpoint.decode_weight_bytes > 0 else {}),
     }
-    policy = configuration.get("prefix_cache.message_checkpoints").value
-    if policy:
-        options["message_checkpoints"] = policy
-    return options
 
 
 def _exhausted(error, plan) -> CapacityError | None:
@@ -485,6 +481,11 @@ def debug_serve(args) -> int:
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options["thinking_token_budget"] = configuration.get("server.thinking_token_budget").value
+    # A serving policy, like the thinking budget: the diagnostic server reads it from the same
+    # configuration key as flare run, and exported packages do not carry it.
+    message_checkpoints = configuration.get("prefix_cache.message_checkpoints").value
+    if message_checkpoints:
+        options["message_checkpoints"] = message_checkpoints
     print(json.dumps({"plan": plan.to_dict()}), file=sys.stderr, flush=True)
     if args.history_drafts is not None:
         if args.history_drafts and (plan.speculation is None or plan.speculation.draft_tokens == 0):

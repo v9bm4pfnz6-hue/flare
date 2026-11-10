@@ -84,6 +84,14 @@ def test_prefix_cache_settings_validate(tmp_path):
         with pytest.raises(UsageError, match="max_age"):
             load(tmp_path, f'[prefix_cache]\nmax_age="{value}"\n')
 
+    assert configuration.get("prefix_cache.message_checkpoints") == Setting("", "default")
+    for value in ("every-message", "coalesced"):
+        loaded = load(tmp_path, f'[prefix_cache]\nmessage_checkpoints="{value}"\n')
+        assert loaded.get("prefix_cache.message_checkpoints") == Setting(value, "[prefix_cache]")
+    for value in ("", "none", "Coalesced"):
+        with pytest.raises(UsageError, match="message_checkpoints"):
+            load(tmp_path, f'[prefix_cache]\nmessage_checkpoints="{value}"\n')
+
 
 def test_recipe_supplies_concurrency_when_the_file_is_silent(tmp_path):
     configuration = load(tmp_path, "[server]\nport = 8001\n")
