@@ -203,3 +203,45 @@ def test_debug_serve_forwards_the_prefill_reduction_into_the_plan():
     source = inspect.getsource(serve.debug_serve)
     assert "prefill_reduction=prefill_reduction_mode(" in source
     assert "args.prefill_reduction" in source
+
+
+def test_prefill_reduction_accepts_the_bf16_first_hop_declaration():
+    from ignition import planning
+
+    assert PreparationConfig(prefill_reduction="bf16-first-hop").prefill_reduction == "bf16-first-hop"
+    assert planning.validate_prefill_reduction("bf16-first-hop") == "bf16-first-hop"
+    # The first hop belongs to the BF16 gather ring, and the setting is a boolean.
+    with pytest.raises(ValueError, match="BF16 gather ring"):
+        create_dma_all_reduce_runtime(None, 0, max_tokens=1, hidden_size=1, bf16_first_hop=True)
+    with pytest.raises(ValueError, match="BF16 gather ring"):
+        create_dma_all_reduce_runtime(None, 0, max_tokens=1, hidden_size=1, bf16_gather=True, bf16_first_hop=1)
+
+
+def test_first_hop_channel_takes_only_reductions_declared_as_bf16_values(monkeypatch):
+    """A channel that sends its first hop as BF16 refuses an FP32 reduction of undeclared values;
+    the owner-packet reduction, which promotes BF16 activations, declares them."""
+    import torch
+    from b12x.comm.pcie import DmaAllReduce
+    from ignition.components import collectives, owner_packet_reduce
+
+    world = 9
+    runtime = DmaAllReduce.__new__(DmaAllReduce)
+    runtime.world_size, runtime._bf16_first_hop, runtime._tree = world, True, None
+    runtime.max_bytes = world * 64 * 4
+    packet = torch.zeros((world, 64))
+    with pytest.raises(ValueError, match="BF16-representable values"):
+        collectives.PreparedAllReduce(packet, packet, runtime=runtime, session=None, coordinator=None, name="plain")
+    declared = []
+
+    class FakeReduce:
+        def __init__(self, source, output, *, runtime, session, coordinator, name, bf16_values=False):
+            declared.append((name, bf16_values, source.dtype))
+
+        def __call__(self, source):
+            return source
+
+    monkeypatch.setattr(owner_packet_reduce, "PreparedAllReduce", FakeReduce)
+    source = torch.zeros((world * 8, 8), dtype=torch.bfloat16)
+    owner_packet_reduce.PreparedOwnerPacketAllReduce(source, torch.zeros_like(source),
+        workspace=torch.zeros(world * 64), runtime=runtime, session=None, coordinator=None, name="layer0.reduce")
+    assert declared == [("layer0.reduce.owner_packet0", True, torch.float32)]

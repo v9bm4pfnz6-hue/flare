@@ -117,6 +117,8 @@ class PreparationConfig:
     # ring. "bf16-gather" runs the same ordered FP32 reduce-scatter and forwards a single BF16
     # rounding of each fully reduced owner chunk in the all-gather phase: the serving BF16
     # activations are bit-identical and the all-gather wire carries half the bytes.
+    # "bf16-first-hop" is the "bf16-gather" ring whose first reduce hop also travels as BF16: that hop
+    # carries a rank's own activations, which are BF16 values, and the receiver forms the same FP32 sum.
     # "tree-2+2+2+2+1" routes the reduction over the PCIe switch tree of nine ranks on four leaf
     # pairs and one single rank: BF16 values to the rank that sums them, FP32 partial sums to the
     # owner, one BF16 rounding per owner. Same arithmetic precision; the FP32 additions group
@@ -132,9 +134,9 @@ class PreparationConfig:
     vision: bool = True
 
     def __post_init__(self):
-        if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather", "tree-2+2+2+2+1"):
+        if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather", "bf16-first-hop", "tree-2+2+2+2+1"):
             raise ValueError(
-                "prefill reduction must be fp32-owner-packet, bf16-gather or tree-2+2+2+2+1"
+                "prefill reduction must be fp32-owner-packet, bf16-gather, bf16-first-hop or tree-2+2+2+2+1"
             )
         if self.prefill_gather not in ("kernel", "ring"):
             raise ValueError("prefill gather must be kernel or ring")
@@ -304,7 +306,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         prefill_collective = (create_dma_all_reduce_runtime(group, device,
             max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
             ipc=package_storage.peer_storage, wire_mode="",
-            bf16_gather=config.prefill_reduction == "bf16-gather",
+            bf16_gather=config.prefill_reduction in ("bf16-gather", "bf16-first-hop"),
+            bf16_first_hop=config.prefill_reduction == "bf16-first-hop",
             tree=(config.prefill_reduction.removeprefix("tree-")
                   if config.prefill_reduction.startswith("tree-") else None)) if dma_prefill else
             create_single_round_all_reduce_runtime(group, device,

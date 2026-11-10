@@ -197,6 +197,8 @@ class PreparedOwnerPacketAllReduce:
                 session=session,
                 coordinator=coordinator,
                 name=f"{name}.owner_packet{len(self.parts)}",
+                # The packet is promoted from BF16 activations, exactly.
+                bf16_values=True,
             )
             self.parts.append((first, end, packet, reduce))
 

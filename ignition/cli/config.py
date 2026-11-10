@@ -126,8 +126,10 @@ class Configuration:
                 raise UsageError(f"{path}: message_checkpoints must be one of {', '.join(MESSAGE_CHECKPOINTS)}")
             if key == "autotune_effort" and value not in AUTOTUNE_EFFORTS:
                 raise UsageError(f"{path}: autotune_effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
-            if key == "prefill_reduction" and value not in ("fp32-owner-packet", "bf16-gather", "tree-2+2+2+2+1"):
-                raise UsageError(f"{path}: prefill_reduction must be fp32-owner-packet, bf16-gather or tree-2+2+2+2+1")
+            if key == "prefill_reduction" and value not in ("fp32-owner-packet", "bf16-gather", "bf16-first-hop",
+                                                            "tree-2+2+2+2+1"):
+                raise UsageError(f"{path}: prefill_reduction must be fp32-owner-packet, bf16-gather, bf16-first-hop "
+                                 "or tree-2+2+2+2+1")
             if key == "prefill_gather" and value not in ("kernel", "ring"):
                 raise UsageError(f"{path}: prefill_gather must be kernel or ring")
             if key == "collective_tuning" and value not in ("static", "runtime"):

@@ -77,7 +77,9 @@ class PreparedAllReduce:
     runtime until every rank has drained native replay.
     """
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, bf16_values=False):
+        """`bf16_values` declares that an FP32 source holds BF16-representable values; a copy-engine channel
+        whose first reduce hop carries BF16 accepts only such reductions."""
         import torch.distributed as dist
         from b12x.comm import pcie
 
@@ -105,6 +107,10 @@ class PreparedAllReduce:
         elif isinstance(runtime, pcie.DmaAllReduce):
             # Copy-engine ring for prefill-sized activations.
             from b12x.comm.pcie._dma_preparation import query_from_metadata
+
+            if getattr(runtime, "bf16_first_hop", False) and not bf16_values:
+                raise ValueError("this channel sends the first reduce hop as BF16: the reduction must declare "
+                                 "BF16-representable values")
 
             self.plan = pcie.plan(query_from_metadata(runtime, shape=tuple(source.shape), dtype=source.dtype),
                                   runtime=runtime)
