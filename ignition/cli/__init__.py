@@ -195,6 +195,10 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " or FP32 sums routed over a PCIe switch tree of four leaf pairs and one"
                                " single rank with one BF16 rounding per owner (nine ranks; FP32 additions"
                                " group differently from the ring); Kimi K3/K3.1 only")
+    advanced.add_argument("--prefill-gather", choices=("kernel", "ring"),
+                          help="prefill gather transport: pushes from b12x kernels, or the copy-engine ring"
+                               " that reduces the same graphs for segments of at least half a mebibyte per"
+                               " rank (the same bytes); Kimi K3/K3.1 only")
     advanced.add_argument("--native-dense-activations", action="store_true",
                           help="use quantized activations instead of auto precision for dense projections:"
                                " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")

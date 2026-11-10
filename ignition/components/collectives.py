@@ -717,6 +717,74 @@ class PreparedAllGather:
         return self.output
 
 
+@torch.library.custom_op("flare::pcie_ring_gather", mutates_args=("slots",))
+def _ring_gather(slots: torch.Tensor, handle: int) -> None:
+    owner = _OWNERS[handle]
+    owner.runtime.all_gather(slots, plan=owner.plan)
+
+
+@_ring_gather.register_fake
+def _fake_ring_gather(slots, handle):
+    pass
+
+
+@torch.library.custom_op("flare::pcie_ring_gather_release", mutates_args=("slots",))
+def _ring_gather_release(slots: torch.Tensor, handle: int) -> None:
+    owner = _OWNERS[handle]
+    owner.runtime.release_gather(plan=owner.plan)
+
+
+@_ring_gather_release.register_fake
+def _fake_ring_gather_release(slots, handle):
+    pass
+
+
+class PreparedRingGather:
+    """All-gather of one equal segment per rank on a copy-engine ring channel.
+
+    `slots` is `[world, *shape]` inside the channel's scratch. Slot `s` holds the segment of
+    rank `(first_rank + s) % world`, the ranks in ring order from this rank's successor, so
+    the last slot is this rank's own segment. The caller writes that slot, calls the component,
+    reads the slots and calls `release()`; until then the channel runs no other reduction or
+    gather, because the slots are the scratch its neighbours write. Every rank declares the same
+    operation name and replays it serially with the channel's reductions. Bytes are copied by the
+    copy engines, never converted, and no staging beyond the channel's scratch is used.
+    """
+
+    def __init__(self, shape, dtype, *, runtime, session, coordinator, name):
+        import torch.distributed as dist
+        from b12x.comm import pcie
+        from b12x.comm.pcie._dma_preparation import gather_query_from_metadata
+
+        if not isinstance(runtime, pcie.DmaAllReduce) or not runtime.gather_capacity:
+            raise ValueError("a ring gather requires a copy-engine ring channel")
+        shape = tuple(shape)
+        self.runtime = runtime
+        self.slots = slots = runtime.gather_slots(shape, dtype)
+        self.first_rank = runtime.gather_rank(0)
+        self.plan = pcie.plan(gather_query_from_metadata(runtime, shape=shape, dtype=dtype), runtime=runtime)
+
+        def prepare(state):
+            def run():
+                state.run_gather(slots)
+                state.release_gather()
+
+            return PreparedCall(run=run, output=slots, owners=(runtime, slots))
+
+        ranks = tuple(dist.get_process_group_ranks(runtime.group))
+        declare(session, (self.plan.request(name=name, prepare_call=prepare,
+            collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
+        self.handle = next(_HANDLES)
+        _OWNERS[self.handle] = self
+
+    def __call__(self):
+        _ring_gather(self.slots, self.handle)
+        return self.slots
+
+    def release(self):
+        _ring_gather_release(self.slots, self.handle)
+
+
 @torch.library.custom_op("flare::roce_all_gather_varlen", mutates_args=("output",))
 def _all_gather_varlen(counts: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]

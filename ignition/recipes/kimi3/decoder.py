@@ -188,7 +188,7 @@ class PreparedMLP:
 class PreparedLatentMoE:
     def __init__(self, weights, source, config, shard, *, runtime, router_runtime, coordinator, session, name, workspace, buffers, storage,
                  route_runtime=None, prefill_route_runtime=None, allocator=None, accumulation_buffers=None,
-                 reduction_staging=None, route_gather_runtime=None, copy_engine=False):
+                 reduction_staging=None, route_gather_runtime=None, copy_engine=False, gather_ring=None):
         tokens, hidden = source.shape
         c, device = config.text, source.device
         latent = c["routed_expert_hidden_size"]
@@ -248,7 +248,8 @@ class PreparedLatentMoE:
                 self.prefill_route_gather = PreparedLatentShardGather(self.down.output, local_logits,
                     self.latent, logits, runtime=prefill_route_runtime, session=session,
                     coordinator=coordinator, name=name + ".latent_router_gather",
-                    buffers=buffers.setdefault("latent_router_transport", {}), allocator=allocator)
+                    buffers=buffers.setdefault("latent_router_transport", {}), allocator=allocator,
+                    ring=gather_ring)
             else:
                 self.down = prepare_projection(self.source, weights["latent_down"], buffer("down", latent),
                     session=session, name=name + ".latent_down", workspace=workspace)
@@ -317,7 +318,7 @@ class PreparedDecoder:
 
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, vocabulary_runtime, embedding_runtime, router_runtime, vision_state,
                  coordinator, session, name, workspace, buffers, kda_records=None, route_runtime=None, context=None,
-                 latent_runtimes=(), scoring=None, prefill_route_runtime=None):
+                 latent_runtimes=(), scoring=None, prefill_route_runtime=None, ring_gather=False):
         # Verification records its candidate rows; other modes ignore records.
         if mode not in ("prefill", "decode", "verify") or mode == "verify" and kda_records is None:
             raise ValueError("Kimi K3 verification decodes recorded candidate rows")
@@ -439,7 +440,9 @@ class PreparedDecoder:
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace,
                     buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=buffers.stage_allocator("moe"),
                     accumulation_buffers=accumulation_buffers, reduction_staging=reduction_staging,
-                    copy_engine=copy_engine)
+                    copy_engine=copy_engine,
+                    # Large prefill gathers may ride the ring that reduces this graph.
+                    gather_ring=runtime if copy_engine and ring_gather else None)
             # The sum buffer is consumed before the next attention or MLP reduction.
             total = self.buffers["total"][:source.shape[0]]
             reduction = copy_engine_reduction if copy_engine else PreparedChunkedAllReduce

@@ -122,6 +122,10 @@ class PreparationConfig:
     # owner, one BF16 rounding per owner. Same arithmetic precision; the FP32 additions group
     # by leaf instead of by ring order, so results are not bit-identical to the ring's.
     prefill_reduction: str = "fp32-owner-packet"
+    # Prefill gather transport. "kernel" pushes every gather from b12x kernels. "ring" moves the
+    # latent and router shards of a graph that reduces on the copy-engine ring over that ring when
+    # a rank's segment is at least half a mebibyte: the same bytes, through the channel's scratch.
+    prefill_gather: str = "kernel"
     # Ranks share each page's context (decode context parallel over every rank, KV interleave 1).
     context_parallel: bool = True
     # The MoonViT encoder and its graphs prepare beside the text model unless the plan serves text only.
@@ -132,6 +136,8 @@ class PreparationConfig:
             raise ValueError(
                 "prefill reduction must be fp32-owner-packet, bf16-gather or tree-2+2+2+2+1"
             )
+        if self.prefill_gather not in ("kernel", "ring"):
+            raise ValueError("prefill gather must be kernel or ring")
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
             raise ValueError("Kimi draft head conversion must be mxfp8 or nvfp4")
         if self.draft_head_quantization is not None and not self.drafting:
@@ -539,7 +545,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
                         session=session, name=name, workspace=arena, buffers=decoder_buffers,
-                        **dict(collectives, runtime=prefill_runtime))
+                        **dict(collectives, runtime=prefill_runtime),
+                        ring_gather=mode == "prefill" and config.prefill_gather == "ring")
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)

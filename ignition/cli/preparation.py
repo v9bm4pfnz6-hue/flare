@@ -53,7 +53,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
            joint_tuning: bool = False, shard_hyperconnections: bool = False,
            force_moe_decode_a16: bool | None = None,
-           prefill_reduction: str | None = None) -> planning.Plan:
+           prefill_reduction: str | None = None, prefill_gather: str | None = None) -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
     from ignition.preparation.collective_ladder import resolve as resolve_ladder
 
@@ -68,7 +68,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
         online_mxfp8=online_mxfp8, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode,
-        prefill_reduction=prefill_reduction_mode(configuration, model, prefill_reduction))
+        prefill_reduction=prefill_reduction_mode(configuration, model, prefill_reduction),
+        prefill_gather=prefill_gather_mode(configuration, prefill_gather))
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
                      collective_tuning=mode, collective_ladder=ladder,
@@ -86,6 +87,18 @@ def prefill_reduction_mode(configuration, model, flag=None):
 
     try:
         return planning.validate_prefill_reduction(value)
+    except planning.UsageError as error:
+        raise UsageError(str(error)) from error
+
+
+def prefill_gather_mode(configuration, flag=None):
+    value = configuration.get("preparation.prefill_gather", flag).value
+    if value is None:
+        value = "kernel"
+    from ignition import planning
+
+    try:
+        return planning.validate_prefill_gather(value)
     except planning.UsageError as error:
         raise UsageError(str(error)) from error
 

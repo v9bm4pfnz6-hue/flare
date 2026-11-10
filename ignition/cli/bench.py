@@ -147,7 +147,7 @@ def run(args):
     plan = derive(configuration, model, Host.discover(), gpus=args.gpus, concurrency=concurrency,
         speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
         prefill_graph_capacities=args.prefill_graph_capacities,
-        prefill_reduction=args.prefill_reduction,
+        prefill_reduction=args.prefill_reduction, prefill_gather=args.prefill_gather,
         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
         compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
         autotune_effort=args.autotune_effort, collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
