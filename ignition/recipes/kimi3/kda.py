@@ -9,14 +9,19 @@ from b12x.sequence import gdn_decode, kda_prefill, short_conv
 
 from ignition.components.gated_norm import PreparedGatedRMSNorm
 from ignition.components.recurrent import prepare_sequence_binding
-from ignition.components.kda_speculation import _record, register_recording
+from ignition.components.kda_speculation import _record, _record_fused, register_recording
+from ignition.preparation.tuning import register_finalizer
 
 from .projections import prepare_projection
 
 
 class PreparedKDA:
+    """`fused_verify` runs a recording verify layer's convolution, recurrence and output norm as one
+    b12x launch, bit-identical to the three launches (gated output, records, convolution and
+    recurrent state); a geometry the fused kernel refuses keeps the three launches."""
+
     def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, buffers, records=None,
-                 allocator=None):
+                 allocator=None, fused_verify=False):
         mode = "decode" if mode == "verify" else mode
         self.records, self.state, self.metadata = records, state, metadata
         tokens, hidden = source.shape
@@ -91,12 +96,35 @@ class PreparedKDA:
             public_bind=bind, bind_method=method, workspace=workspace, run_options=self.options,
             set_binding=lambda binding: setattr(self, "recurrence", binding))
         self.gated = gated
+        self.fused = None
+        if records is not None and fused_verify:
+            self.fused_reads = [self.input, raw_g, recurrent, weights["convolution"], metadata.query_start_loc,
+                                metadata.state_indices, metadata.convolution_slots, metadata.fresh,
+                                metadata.accepted_tokens, metadata.num_seqs, metadata.num_tokens]
+            register_finalizer(session, self._prepare_fused, workspace=workspace)
+
+    def _prepare_fused(self):
+        """After both bindings exist: prepare the one-launch verify, or keep the three launches."""
+        try:
+            self.fused = gdn_decode.prepare_kda_fused_verify(self.recurrence, self.convolution)
+        except ValueError as error:  # geometry the fused kernel does not cover (e.g. tuned block_v=16)
+            import warnings
+
+            warnings.warn(f"KDA fused verify disabled for this layer: {error}", stacklevel=2)
+            self.fused = None
 
     def __call__(self, source):
         p = self.projections
         p["input"](source)
         self.forget.copy_(self.forget_source)
         p["forget"](self.forget)
+        fused = self.fused
+        if fused is not None and (fused.binding is not self.recurrence or fused.conv is not self.convolution):
+            self._prepare_fused()  # bindings were replaced after preparation (context plans)
+            fused = self.fused
+        if fused is not None:
+            _record_fused(self.fused_reads, self.gated, *self.records, self.state.convolution, self.handle)
+            return p["output"](self.gated)
         short_conv.run(self.convolution)
         if self.records is not None:
             _record(self.reads, self.gated, *self.records, self.handle)

@@ -62,6 +62,20 @@ def _fake_record(reads, output, corrections, keys_gates, handle):
     pass
 
 
+@torch.library.custom_op("flare::kda_record_fused",
+                         mutates_args=("output", "corrections", "keys_gates", "convolution_state"))
+def _record_fused(reads: list[torch.Tensor], output: torch.Tensor, corrections: torch.Tensor,
+                  keys_gates: torch.Tensor, convolution_state: torch.Tensor, handle: int) -> None:
+    """Short convolution, recording verification and output norm in one b12x launch."""
+    owner = _OWNERS[handle]
+    gdn_decode.run_kda_fused_verify(owner.fused, **owner.options)
+
+
+@_record_fused.register_fake
+def _fake_record_fused(reads, output, corrections, keys_gates, convolution_state, handle):
+    pass
+
+
 def register_recording(owner):
     handle = next(_HANDLES)
     _OWNERS[handle] = owner
