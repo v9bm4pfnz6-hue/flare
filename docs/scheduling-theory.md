@@ -278,6 +278,22 @@ It ignores decode competition and assumes prefill timing is independent of
 context. Its purpose is to expose greedy chunking errors, not to price an
 entire mixed workload as isolated work.
 
+The native scheduler applies this recurrence to one case, where its
+assumptions hold within a single action sequence: the tokens from a request's
+position to its next stop (a checkpoint boundary or the prompt end), when one
+graph of the largest capacity can hold them. A measured prefill graph that
+would leave part of that segment for a later launch is a candidate only if it
+starts a cover of the segment whose summed measured durations are within
+1/128 of the minimum over measured graphs. With capacities 128 and 256
+measured at 215 ms and 340 ms, 200 tokens run in one padded 256-row launch
+(340 ms); value per time alone runs 128 + 128 (430 ms), because the full
+128-row launch moves more tokens per millisecond. Graphs that finish the
+segment alone, unmeasured graphs, segments longer than the largest graph, and
+catalogs whose capacities are not multiples of the smallest keep every
+candidate, and candidates are still ranked by value per time, so competition
+with other requests is unchanged in form. `starts_fastest_cover` in
+[`policy.rs`](../helios/src/scheduler/policy.rs) implements the rule.
+
 For generated output `g` and a length prior `L`, expected remaining length is
 
 ```text

@@ -1256,6 +1256,52 @@ fn small_prefill_tails_choose_the_best_effective_value_rate() {
     }
 }
 
+fn remainder_costs(s: &mut RequestScheduler) {
+    // A launch costs a fixed part plus a part per row, as measured on a nine-GPU deployment.
+    for (capacity, ms) in [(64, 150), (128, 215), (256, 340), (512, 550), (1024, 930), (2048, 1650), (4096, 3300)] {
+        set_cost(s, GraphKind::Prefill, 1, capacity, ms * MS);
+    }
+}
+
+#[test]
+fn prefill_segments_with_a_remainder_take_their_fastest_cover() {
+    // 200 tokens up to a checkpoint: one padded 256-row launch (340 ms) finishes before
+    // 128 + 128 (430 ms), although a full 128-row launch moves more tokens per millisecond.
+    let mut s = interactive_engine(1, false);
+    remainder_costs(&mut s);
+    let h = add(&mut s, 1, 4096, 128);
+    s.request_mut(h).unwrap().message_boundaries = vec![200];
+    assert_eq!(step(&mut s, 0).kind, GraphKind::Init);
+    let plan = s.plan().unwrap();
+    assert_eq!((plan.kind, plan.token_capacity, plan.lanes[0].tokens), (GraphKind::Prefill, 256, 200));
+
+    // 384 tokens with a slow 512-row graph: 256 + 128 and 128 + 256 are the same fastest cover
+    // (555 ms), so both first launches stay candidates and value per time runs the 256-row one.
+    let mut s = interactive_engine(1, false);
+    remainder_costs(&mut s);
+    set_cost(&mut s, GraphKind::Prefill, 1, 512, 800 * MS);
+    let h = add(&mut s, 1, 4096, 128);
+    s.request_mut(h).unwrap().message_boundaries = vec![384];
+    assert_eq!(step(&mut s, 0).kind, GraphKind::Init);
+    let plan = s.plan().unwrap();
+    assert_eq!((plan.kind, plan.token_capacity, plan.lanes[0].tokens), (GraphKind::Prefill, 256, 256));
+}
+
+#[test]
+fn unmeasured_prefill_graphs_do_not_remove_measured_first_launches() {
+    // With only the 128-row graph measured, no cover of 200 tokens can be priced against it.
+    let mut s = cold_engine(1, false);
+    s.prefill_graphs(&[64, 128, 256, 512]).unwrap();
+    set_cost(&mut s, GraphKind::Prefill, 1, 128, 215 * MS);
+    let h = add(&mut s, 1, 4096, 128);
+    s.request_mut(h).unwrap().message_boundaries = vec![200];
+    assert_eq!(measured_step(&mut s, MS / 10, 0).kind, GraphKind::Init);
+    let (values, age, _) = s.lane_values(s.window_remaining().unwrap());
+    let mut candidates = Vec::new();
+    s.candidates(&mut candidates, &values, age);
+    assert!(candidates.iter().any(|c| c.kind == GraphKind::Prefill && c.capacity == 128));
+}
+
 #[test]
 fn equivalent_prefill_tails_use_the_smaller_graph_despite_a_faster_padded_estimate() {
     let mut s = interactive_engine(1, false);

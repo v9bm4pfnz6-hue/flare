@@ -341,6 +341,72 @@ impl RequestScheduler {
         .saturating_sub(request.consumed_tokens as usize)
     }
 
+    /// Whether a measured prefill graph that leaves part of the request's current segment
+    /// unprocessed still starts a fastest cover of that segment.
+    ///
+    /// The segment is the tokens up to the next stop of this request, when one graph of the
+    /// largest capacity can hold them. Value per time ranks a full small graph above a padded
+    /// larger one even when the small graph leaves a remainder that needs another launch: with
+    /// capacities 128 and 256 measured at 215 ms and 340 ms, 200 tokens would run as 128 + 128 in
+    /// 430 ms instead of 340 ms. Such a graph stops being a candidate when the measured graphs
+    /// cover the segment sooner another way. Graphs that finish the segment alone, unmeasured
+    /// graphs, longer segments, and catalogs that are not multiples of their smallest capacity
+    /// keep the existing rules.
+    fn starts_fastest_cover(
+        &self,
+        request: &LiveRequest,
+        kind: GraphKind,
+        batch: usize,
+        capacity: usize,
+    ) -> bool {
+        const UNITS: usize = 128;
+        const CAPACITIES: usize = 16;
+        let catalog = self.prefill_catalog(kind);
+        let (Some(&unit), Some(&largest)) = (catalog.first(), catalog.last()) else {
+            return true;
+        };
+        let segment = self.prefill_work(request, largest);
+        let work = self.prefill_work(request, capacity);
+        if work >= segment
+            || segment >= largest
+            || work != capacity
+            || catalog.len() > CAPACITIES
+            || catalog.iter().any(|c| c % unit != 0)
+        {
+            return true;
+        }
+        let units = segment.div_ceil(unit);
+        if units > UNITS {
+            return true;
+        }
+        let mut measured = [(0usize, 0u64); CAPACITIES];
+        let mut count = 0;
+        for &c in catalog {
+            if let Some(ns) = self.costs.duration(kind, batch, c).filter(|ns| *ns > 0) {
+                measured[count] = (c / unit, ns);
+                count += 1;
+            }
+        }
+        let Some(&(own_units, own_ns)) =
+            measured[..count].iter().find(|(c, _)| *c == capacity / unit)
+        else {
+            return true;
+        };
+        let mut fastest = [u64::MAX; UNITS + 1];
+        fastest[0] = 0;
+        for covered in 1..=units {
+            for &(c, ns) in &measured[..count] {
+                let rest = fastest[covered.saturating_sub(c)];
+                if rest != u64::MAX {
+                    fastest[covered] = fastest[covered].min(ns.saturating_add(rest));
+                }
+            }
+        }
+        let rest = fastest[units - own_units];
+        // Estimates within 1/128 of each other are one plan; ties keep both first launches.
+        rest == u64::MAX || own_ns.saturating_add(rest) <= fastest[units] + fastest[units] / 128
+    }
+
     pub fn submission_window_available(&self, duration_ns: u64) -> bool {
         self.submissions.len() < 2
             && !self.submissions.values().any(|s| s.requires_feedback)
@@ -855,6 +921,7 @@ impl RequestScheduler {
                     || (duration_ns == 0 && catalog.iter()
                         .take_while(|&&smaller| smaller < capacity)
                         .any(|&smaller| self.prefill_work(r, smaller) == work))
+                    || !self.starts_fastest_cover(r, kind, batch, capacity)
                 {
                     continue;
                 }
