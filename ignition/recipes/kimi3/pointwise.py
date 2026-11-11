@@ -203,10 +203,16 @@ def _unpack_norm_kv_and_tail(Gathered, Weight, LatentOut, g_row_stride, g_rank_s
 
 def unpack_and_rms_norm_qkv(gathered, local_q: int, local_kv: int, q_weight, kv_weight, q_norm_out, latent_out, eps: float):
     """Unpack rank-interleaved [rows, world, width] latents and apply exact 4-warp Q/KV RMSNorm + RoPE tail copy."""
-    rows = gathered.shape[0]
+    rows, world, width = gathered.shape
     q_width = q_norm_out.shape[1]
     kv_norm_width = kv_weight.shape[0]
     tail_width = latent_out.shape[1] - kv_norm_width
+    if (local_q + local_kv > width or q_width > world * local_q or latent_out.shape[1] > world * local_kv
+            or not 0 <= tail_width <= 64 or q_weight.shape != (q_width,)
+            or q_norm_out.shape[0] != rows or latent_out.shape[0] != rows
+            or gathered.stride(2) != 1 or q_norm_out.stride(1) != 1 or latent_out.stride(1) != 1):
+        raise ValueError("fused latent unpacking requires rank shards that cover the query and KV latents, "
+                         "contiguous rows and a tail of at most 64 columns")
     q_block = triton.next_power_of_2(q_width)
     kv_block = triton.next_power_of_2(kv_norm_width)
     torch.library.wrap_triton(_unpack_norm_q)[(rows,)](

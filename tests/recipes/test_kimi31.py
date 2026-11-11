@@ -518,7 +518,9 @@ def test_tp9_small_prefill_graphs_reduce_on_the_direct_channel():
 def test_tp9_lse_geometry_uses_measured_rows():
     from ignition.recipes.kimi3.dcp import lse_geometry
 
-    assert lse_geometry(1, 9) == (512, 16)
+    assert lse_geometry(1, 9) == (128, 32)
+    assert lse_geometry(4, 9) == (256, 8)
     assert lse_geometry(8, 9) == (512, 8)
+    assert lse_geometry(24, 9) == (384, 32)
     assert lse_geometry(32, 9) == (384, 32)
     assert lse_geometry(32, 8) == (512, 8)

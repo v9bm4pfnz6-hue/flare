@@ -113,11 +113,13 @@ def _prepare_speculative_scores_kernel(Logits, Histogram, Candidates, Safe, Para
     p_pres = tl.load(p_base + 4).to(tl.float32)
     p_freq = tl.load(p_base + 5).to(tl.float32)
     sc = tl.load(Logits + b * log_b_stride + w * log_w_stride + cols.to(tl.int64), mask=mask, other=float('-inf')).to(tl.float32)
-    adj = tl.where(sc > 0.0, sc / penalty, sc * penalty)
+    # IEEE division and, with FMA contraction disabled at the launch, the unfused order of operations
+    # reproduce the ATen score chain bit for bit, as the draft score program does.
+    adj = tl.where(sc > 0.0, tl.math.div_rn(sc, penalty), sc * penalty)
     has_cnt = cnt > 0.0
     sc = tl.where(has_cnt, adj, sc)
     sc = sc - tl.where(has_cnt, 1.0, 0.0) * p_pres - cnt * p_freq
-    sc = sc / tl.where(temp > 0.0, temp, 1.0)
+    sc = tl.math.div_rn(sc, tl.where(temp > 0.0, temp, 1.0))
     g_en = tl.load(GrammarEnabled + s).to(tl.int32) != 0
     if g_en:
         g_row = pref if COND_GRAMMAR else 0
@@ -130,8 +132,9 @@ def _prepare_speculative_scores_kernel(Logits, Histogram, Candidates, Safe, Para
     tl.atomic_max(Maximum + idx, bmax)
     if bmax > float('-inf'):
         tl.atomic_or(RowFlags + idx * 3 + 1, 1)
-    bad = tl.sum(tl.where(mask & ((sc != sc) | (sc == float('inf'))), 1, 0), axis=0)
-    if bad > 0:
+    # The block maximum drops NaN scores; amax returns NaN for a row that holds one.
+    nan = tl.sum(tl.where(mask & (sc != sc), 1, 0), axis=0)
+    if nan > 0:
         tl.atomic_or(RowFlags + idx * 3 + 2, 1)
 
 
@@ -141,10 +144,12 @@ def _finalize_speculative_valid_kernel(RowFlags, ValidOut, ScoresOut, Maximum,
     idx = tl.program_id(0)
     pre_ok = tl.load(RowFlags + idx * 3) != 0
     has_fin = tl.load(RowFlags + idx * 3 + 1) != 0
-    has_bad = tl.load(RowFlags + idx * 3 + 2) != 0
-    if has_bad:
+    has_nan = tl.load(RowFlags + idx * 3 + 2) != 0
+    maximum = tl.load(Maximum + idx)
+    if has_nan:
         tl.store(Maximum + idx, float('nan'))
-    is_valid = pre_ok & has_fin & (~has_bad)
+    # A finite row maximum: a score above -inf, no NaN and no +inf.
+    is_valid = pre_ok & has_fin & (~has_nan) & (maximum < float('inf'))
     tl.store(ValidOut + idx, is_valid)
     if WRITE_DUMMY and pre_ok and (not is_valid):
         c = 0
@@ -307,7 +312,7 @@ class PreparedSpeculativeDistributions:
             self.logits.stride(0), self.logits.stride(1), state.histogram.stride(0),
             self.candidates.stride(0), params.stride(0), g_masks.stride(0), g_masks.stride(1),
             width, vocab, self.prefix_offset, indices, has_cond_grammar, write_dummy_invalid, block,
-            num_warps=4)
+            num_warps=4, enable_fp_fusion=False)
         torch.library.wrap_triton(_finalize_speculative_valid_kernel)[(n_rows,)](
             self.row_flags, self.valid, self.scores, self.maximum,
             vocab, write_dummy_invalid, block, num_warps=4)

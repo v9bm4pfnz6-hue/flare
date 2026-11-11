@@ -213,16 +213,18 @@ class ContextParallel:
     index_exchange: object = None
 
 
-# Measured 2026-11-09 on the nine-GPU RTX PRO 6000 TP9 topology. Each geometry
-# matched 512x8 bitwise and did not regress in two interleaved 50-sample runs;
-# evidence is validation/lse-geometry-summary-20261109.json in the candidate tree.
+# Measured on the nine-GPU RTX PRO 6000 TP9 topology; every geometry matched 512x8 bitwise.
+# Rows 1 to 6 and 16 come from one sweep of the quad transport on 2026-11-11 (21 samples of
+# 24-call graphs per geometry, a change kept from 2% of the previous entry's time, not repeated;
+# optimization-team/lead/evidence/M-20261111-22/bench/lse-quad-sweep.json in the candidate tree).
+# The other rows did not regress in two interleaved 50-sample runs of the push transport on
+# 2026-11-09 (validation/lse-geometry-summary-20261109.json). Rows 21 to 32 share one geometry.
 _LSE_GEOMETRY_BY_ROWS = {
-    24: (256, 32),
-    5: (256, 8),
     1: (128, 32),
     2: (128, 16),
     3: (128, 32),
     4: (256, 8),
+    5: (256, 8),
     6: (384, 8),
     7: (384, 16),
     9: (384, 16),

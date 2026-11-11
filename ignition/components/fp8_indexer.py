@@ -60,7 +60,9 @@ class PreparedFP8Indexer:
         declare(session, (self.query_plan.request(name=name + ".query",
             prepare_call=lambda state: PreparedCall(run=lambda: state.quantize(*self.query_arguments))),))
         self.pages = pages
-        self.packed_pages = pages if (mode == "prefill" or pages.is_contiguous()) else buffers.zeros(pages.shape, torch.int32)
+        # Decode reads contiguous int32 page rows in place; other tables are packed into its own rows.
+        self.packed_pages = (pages if mode == "prefill" or (pages.is_contiguous() and pages.dtype == torch.int32)
+                             else buffers.zeros(pages.shape, torch.int32))
         caps = dsa_indexer.Caps(device=query.device, num_q_heads=heads, max_q_rows=rows,
             max_page_table_width=pages.shape[1], topk=output.shape[1], mode=mode,
             supertile_k=(min(prefill_records_per_call, pages.shape[1] * 64)
@@ -76,7 +78,10 @@ class PreparedFP8Indexer:
             slots, self.cache.stride(0), self.rotation == "hadamard", num_warps=4)
 
     def __call__(self):
-        torch.mul(self.weights, self.weight_normalization, out=self.scaled_weights)
+        # The copy widens BF16 head weights exactly and the product is FP32; 32 heads need no product.
+        self.scaled_weights.copy_(self.weights)
+        if self.weight_normalization != 1.0:
+            self.scaled_weights.mul_(self.weight_normalization)
         glm_pool.quantize_queries(*self.query_arguments, plan=self.query_plan)
         if self.packed_pages is not self.pages:
             self.packed_pages.copy_(self.pages)

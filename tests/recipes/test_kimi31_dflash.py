@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from ignition.components.parallel import TensorParallelShard
+from tests.triton_interpreter import interpreted, run_interpreted
 from ignition.recipes.kimi3.config import DSparkConfig, ModelConfig
 from ignition.recipes.kimi3.pool import continuation_layout, page_bytes
 from ignition.recipes.kimi31.dflash_config import DFlash2Config
@@ -64,6 +65,11 @@ def test_rejects_incompatible_draft(change):
         DFlash2Config.from_dict(raw, target.text)
 
 
+def test_private_latent_window_cases_in_triton_interpreter():
+    run_interpreted(__file__, 7, "test_private_latent_window_excludes_inactive_and_preserves_history")
+
+
+@interpreted
 @pytest.mark.parametrize("start,count", [(0,5),(17,5),(1023,5),(1024,5),(1025,3),(500001,5),(1025,0)])
 def test_private_latent_window_excludes_inactive_and_preserves_history(start, count):
     from ignition.recipes.kimi31.dflash import stage_latent_window

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tests.components.completion_support import RecordOnlyLogprobs, completion_outputs
+from tests.triton_interpreter import interpreted, run_interpreted
 
 from ignition.components.sampling import ERROR, FINISHED, RUNNING
 from ignition.recipes.qwen38.sampling import DeviceRequestState, RequestAdmission
@@ -163,6 +164,13 @@ def test_rng_domains_epoch_reuse_and_reservation():
             sample.prepare()
 
 
+def test_conditional_score_cases_in_triton_interpreter():
+    run_interpreted(__file__, 6, "test_conditional_penalties_include_only_prior_drafts",
+                    "test_invalid_conditional_id_does_not_index_histogram_out_of_bounds",
+                    "test_draft_penalties_ignore_unoffered_candidates")
+
+
+@interpreted
 def test_conditional_penalties_include_only_prior_drafts():
     state, _, commit, _ = example()
     state.parameters[2] = torch.tensor([1., 1., 0., 2., 3., .5])
@@ -180,6 +188,7 @@ def test_conditional_penalties_include_only_prior_drafts():
     assert op.valid.tolist() == [[True, False, False, False]]
 
 
+@interpreted
 def test_invalid_conditional_id_does_not_index_histogram_out_of_bounds():
     initialized = torch.cuda.is_initialized()
     state, _, commit, _ = example()
@@ -190,6 +199,7 @@ def test_invalid_conditional_id_does_not_index_histogram_out_of_bounds():
     assert torch.cuda.is_initialized() == initialized
 
 
+@interpreted
 @pytest.mark.parametrize("prefix_offset", [0, 1, 2, 3])
 def test_draft_penalties_ignore_unoffered_candidates(prefix_offset):
     state, _, commit, _ = example()
