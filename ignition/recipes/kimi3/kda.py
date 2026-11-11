@@ -21,7 +21,7 @@ class PreparedKDA:
     recurrent state); a geometry the fused kernel refuses keeps the three launches."""
 
     def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, buffers, records=None,
-                 allocator=None, fused_verify=False):
+                 allocator=None, fused_verify=False, dual_wave=False):
         mode = "decode" if mode == "verify" else mode
         self.records, self.state, self.metadata = records, state, metadata
         tokens, hidden = source.shape
@@ -42,10 +42,30 @@ class PreparedKDA:
         self.input = buffer("input", columns)
         qkv, self.forget_source, gate, beta, _ = self.input.split(
             (3 * width, 128, width, heads, columns - 4 * width - 128 - heads), dim=-1)
-        self.projections = {key: prepare_projection(x, weights[key], y, session=session,
-            name=name + "." + key, workspace=workspace) for key, x, y in (
-                ("input", source, self.input), ("forget", self.forget, raw_g),
-                ("output", gated, buffer("output", hidden)))}
+        out_buf = buffer("output", hidden)
+        self.output_buffer = out_buf
+        self.dual_wave = bool(dual_wave and mode == 'prefill' and tokens % 2 == 0)
+        if self.dual_wave:
+            half = tokens // 2
+            self.half = half
+            self.projections = {}
+            self.half_projections = (
+                {key: prepare_projection(x, weights[key], y, session=session,
+                    name=f'{name}.{key}.w0', workspace=workspace) for key, x, y in (
+                        ('input', source[:half], self.input[:half]),
+                        ('forget', self.forget[:half], raw_g[:half]),
+                        ('output', gated[:half], out_buf[:half]))},
+                {key: prepare_projection(x, weights[key], y, session=session,
+                    name=f'{name}.{key}.w1', workspace=workspace) for key, x, y in (
+                        ('input', source[half:], self.input[half:]),
+                        ('forget', self.forget[half:], raw_g[half:]),
+                        ('output', gated[half:], out_buf[half:]))},
+            )
+        else:
+            self.projections = {key: prepare_projection(x, weights[key], y, session=session,
+                name=name + "." + key, workspace=workspace) for key, x, y in (
+                    ("input", source, self.input), ("forget", self.forget, raw_g),
+                    ("output", gated, out_buf))}
         sequences = metadata.query_start_loc.numel() - 1
         conv_args = dict(x=qkv, conv_weight=weights["convolution"], query_start_loc=metadata.query_start_loc,
             state_slot_ids=metadata.convolution_slots, state_is_fresh=metadata.fresh,
@@ -112,6 +132,22 @@ class PreparedKDA:
 
             warnings.warn(f"KDA fused verify disabled for this layer: {error}", stacklevel=2)
             self.fused = None
+
+    def run_in_half(self, wave: int, source_half):
+        hp = self.half_projections[wave]
+        sl = slice(0, self.half) if wave == 0 else slice(self.half, 2 * self.half)
+        hp['input'](source_half)
+        self.forget[sl].copy_(self.forget_source[sl])
+        hp['forget'](self.forget[sl])
+
+    def run_core(self):
+        short_conv.run(self.convolution)
+        kda_prefill.run(self.recurrence, **self.options)
+        self.norm()
+
+    def run_out_half(self, wave: int):
+        sl = slice(0, self.half) if wave == 0 else slice(self.half, 2 * self.half)
+        return self.half_projections[wave]['output'](self.gated[sl])
 
     def __call__(self, source):
         p = self.projections

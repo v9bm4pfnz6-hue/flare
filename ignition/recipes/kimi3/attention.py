@@ -30,7 +30,8 @@ FP8 = torch.float8_e4m3fn
 class PreparedMLA:
     def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
                  coordinator=None, context=None, peers=None, allocator=None, index_cache=None, index_peers=None,
-                 eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None, selection=None, gather_ring=None):
+                 eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None, selection=None, gather_ring=None,
+                 dual_wave=False):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
         device = source.device
@@ -94,10 +95,23 @@ class PreparedMLA:
                 self.gathered_latents = buffer("gathered_latents", world * width, rows=rows)
                 self.latent_gather = PreparedChunkedAllGather(self.send, self.gathered_latents, runtime=latents,
                     session=session, coordinator=coordinator, name=name + ".gather_latents")
+        out_buf = buffer("output", hidden)
+        self.output_buffer = out_buf
+        self.dual_wave = bool(dual_wave and mode == 'prefill' and tokens % 2 == 0)
         self.projections = {key: prepare_projection(x, weights[key], y, session=session,
             name=name + "." + key, workspace=workspace)
-            for key, x, y in (("latent_gate", source, self.local), ("q_b", self.query_norm, self.query.view(tokens, -1)),
-                             ("output", self.expanded, buffer("output", hidden)))}
+            for key, x, y in (("latent_gate", source, self.local), ("q_b", self.query_norm, self.query.view(tokens, -1)))}
+        if self.dual_wave:
+            self.half = tokens // 2
+            self.out_halves = (
+                prepare_projection(self.expanded[:self.half], weights['output'], out_buf[:self.half],
+                                   session=session, name=name + '.output.w0', workspace=workspace),
+                prepare_projection(self.expanded[self.half:], weights['output'], out_buf[self.half:],
+                                   session=session, name=name + '.output.w1', workspace=workspace),
+            )
+        else:
+            self.projections["output"] = prepare_projection(self.expanded, weights["output"], out_buf,
+                                                            session=session, name=name + ".output", workspace=workspace)
         self.shards = ContextShards() if context is None else context.shards
         self.peers = peers
         self.slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
@@ -159,7 +173,7 @@ class PreparedMLA:
                 session=session, coordinator=context.coordinator, name=name + ".combine",
                 threads=threads, block_limit=block_limit)
 
-    def __call__(self, source):
+    def pre_output(self, source):
         p, m, shards = self.projections, self.metadata, self.shards
         p["latent_gate"](source)
         if getattr(self, 'latent_ring', None) is not None:
@@ -215,7 +229,15 @@ class PreparedMLA:
         self.expanded.view(att_rows, att_heads, 128).copy_(torch.bmm(self.attended.transpose(0, 1), self.weights["value"]).transpose(0, 1))
         if self.gated:
             sigmoid_gate(self.expanded, self.gate)
-        return p["output"](self.expanded)
+        return self.expanded
+
+    def run_out_half(self, wave: int):
+        sl = slice(0, self.half) if wave == 0 else slice(self.half, 2 * self.half)
+        return self.out_halves[wave](self.expanded[sl])
+
+    def __call__(self, source):
+        self.pre_output(source)
+        return self.projections["output"](self.expanded)
 
 
 class PreparedContextPrefill:

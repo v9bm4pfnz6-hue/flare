@@ -251,7 +251,7 @@ class PreparedLatentMoE:
     def __init__(self, weights, source, config, shard, *, runtime, router_runtime, coordinator, session, name, workspace, buffers, storage,
                  route_runtime=None, prefill_route_runtime=None, allocator=None, accumulation_buffers=None,
                  reduction_staging=None, route_gather_runtime=None, copy_engine=False, gather_ring=None,
-                 stats_runtime=None):
+                 stats_runtime=None, concurrent_shared=True):
         tokens, hidden = source.shape
         c, device = config.text, source.device
         latent = c["routed_expert_hidden_size"]
@@ -345,7 +345,33 @@ class PreparedLatentMoE:
                                   buffers=buffers.setdefault("shared", {}), allocator=allocator,
                                   workspace=workspace, parallel_plans=(self.router_projection.plan, self.down.plan,
                                       self.experts.plan, self.up.plan)
-                                  if self.route_gather is not None or self.prefill_route_gather is not None else ())
+                                  if concurrent_shared and (self.route_gather is not None or self.prefill_route_gather is not None) else ())
+
+    def phase_down_pack(self, source):
+        self.router_projection(source)
+        self.down(source)
+        self.prefill_route_gather.pack_ring()
+
+    def phase_route_ring(self):
+        self.prefill_route_gather.ring_and_unpack()
+
+    def phase_router(self):
+        self.router(self.router_logits)
+
+    def phase_experts(self):
+        return self.experts()
+
+    def phase_expert_reduce(self):
+        if getattr(self, 'expert_reduce_norm', None) is not None:
+            self.expert_reduce_norm(self.expert_output)
+        else:
+            self.expert_reduce(self.expert_output)
+            rms_norm_columns(self.latent_sum, self.latent_norm, self.up_input, self.eps, begin=self.latent_begin)
+
+    def phase_up_combine(self, shared_out):
+        self.up(self.up_input)
+        self.output.add_(shared_out)
+        return self.output
 
     def __call__(self, source):
         two_stage = self.shared.concurrent and self.prefill_route_gather is not None
@@ -490,11 +516,83 @@ class PreparedDecoder:
             shards = context.shards if context is not None else ContextShards()
             self.selection = PreparedSelectionMetadata(metadata, shards, rows=source.shape[0],
                 device=source.device, allocator=allocator)
+        self.dual_wave = bool(
+            mode == 'prefill' and copy_engine and getattr(runtime, 'direct_mode', '')
+            and active_gather_ring is not None and stats_runtime is not None
+            and workspace is not None and workspace.overlap
+            and tokens >= 1024 and tokens % 512 == 0
+            and (not self.auxiliary_layers or config.draft.auxiliary_source == 'attention_input')
+        )
+        if self.dual_wave:
+            self.half_tokens = tokens // 2
+            if 'dual_mlp_in' not in self.buffers or self.buffers['dual_mlp_in'].shape[0] < tokens:
+                self.buffers['dual_mlp_in'] = zeros((tokens, hidden))
+            self.dual_mlp_in = self.buffers['dual_mlp_in'][:tokens]
+            self.comp_stream_handle = workspace.auxiliary_stream.cuda_stream
+            self.dual_layers = []
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
             kind = config.layers[index]
             kwargs = dict(mode=mode, session=session, name=prefix + ".attention", workspace=workspace,
                           buffers=self.buffers.setdefault(kind, {}), allocator=buffers.stage_allocator(kind))
+            if self.dual_wave:
+                half = self.half_tokens
+                attn_in = self.buffers['moe']['output'][:tokens]
+                mlp_in = self.dual_mlp_in
+                total = self.buffers['total'][:tokens]
+                reduction_args = dict(workspace=accumulation_buffers, staging=reduction_staging)
+                attention = (PreparedKDA(w['attention'], attn_in, pool.recurrent(index), self.delta,
+                    eps=config.text['rms_norm_eps'], dual_wave=True, **kwargs) if kind == 'kda' else
+                    PreparedMLA(w['attention'], attn_in, metadata, pool.attention(index), context=context,
+                                index_cache=pool.index(index) if kind == 'dsa' else None,
+                                eps=config.text['rms_norm_eps'],
+                                peers=context.peers.get(index) if context is not None else None,
+                                index_peers=(context.index_peers.get(index)
+                                             if context is not None and context.index_peers is not None else None),
+                                selection=self.selection, coordinator=coordinator,
+                                latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
+                                             latent_runtimes[-1] if latent_runtimes else None),
+                                gather_ring=active_gather_ring, dual_wave=True, **kwargs))
+                attn_out = attention.output_buffer
+                attn_red_a = copy_engine_reduction(attn_out[:half], total[:half], runtime=runtime,
+                    coordinator=coordinator, session=session, name=prefix + '.attn_reduce.w0', **reduction_args)
+                attn_red_b = copy_engine_reduction(attn_out[half:], total[half:], runtime=runtime,
+                    coordinator=coordinator, session=session, name=prefix + '.attn_reduce.w1', **reduction_args)
+                if 'mlp' in w:
+                    dense_buf = self.buffers.setdefault('dense_dw', {})
+                    mlp_a = PreparedMLP(w['mlp'], mlp_in[:half], session=session, name=prefix + '.mlp.w0',
+                                        buffers=dense_buf.setdefault('w0', {}), allocator=buffers.stage_allocator('dense'),
+                                        workspace=workspace)
+                    mlp_b = PreparedMLP(w['mlp'], mlp_in[half:], session=session, name=prefix + '.mlp.w1',
+                                        buffers=dense_buf.setdefault('w1', {}), allocator=buffers.stage_allocator('dense'),
+                                        workspace=workspace)
+                    mlp_red_a = copy_engine_reduction(mlp_a.down.output, total[:half], runtime=runtime,
+                        coordinator=coordinator, session=session, name=prefix + '.mlp_reduce.w0', **reduction_args)
+                    mlp_red_b = copy_engine_reduction(mlp_b.down.output, total[half:], runtime=runtime,
+                        coordinator=coordinator, session=session, name=prefix + '.mlp_reduce.w1', **reduction_args)
+                    self.dual_layers.append((w, kind, attention, ('dense', mlp_a, mlp_b), attn_red_a, attn_red_b, mlp_red_a, mlp_red_b))
+                else:
+                    moe_dw = self.buffers.setdefault('moe_dw', {})
+                    moe_a = PreparedLatentMoE(w, mlp_in[:half], config, weights.shard, runtime=runtime,
+                        router_runtime=router_runtime, prefill_route_runtime=prefill_route_runtime,
+                        coordinator=coordinator, session=session, name=prefix + '.moe.w0', workspace=workspace,
+                        buffers=moe_dw.setdefault('w0', {}), storage=buffers, allocator=buffers.stage_allocator('moe'),
+                        accumulation_buffers=accumulation_buffers, reduction_staging=reduction_staging,
+                        copy_engine=True, gather_ring=active_gather_ring, stats_runtime=stats_runtime,
+                        concurrent_shared=False)
+                    moe_b = PreparedLatentMoE(w, mlp_in[half:], config, weights.shard, runtime=runtime,
+                        router_runtime=router_runtime, prefill_route_runtime=prefill_route_runtime,
+                        coordinator=coordinator, session=session, name=prefix + '.moe.w1', workspace=workspace,
+                        buffers=moe_dw.setdefault('w1', {}), storage=buffers, allocator=buffers.stage_allocator('moe'),
+                        accumulation_buffers=accumulation_buffers, reduction_staging=reduction_staging,
+                        copy_engine=True, gather_ring=active_gather_ring, stats_runtime=stats_runtime,
+                        concurrent_shared=False)
+                    mlp_red_a = copy_engine_reduction(moe_a.output, total[:half], runtime=runtime,
+                        coordinator=coordinator, session=session, name=prefix + '.mlp_reduce.w0', **reduction_args)
+                    mlp_red_b = copy_engine_reduction(moe_b.output, total[half:], runtime=runtime,
+                        coordinator=coordinator, session=session, name=prefix + '.mlp_reduce.w1', **reduction_args)
+                    self.dual_layers.append((w, kind, attention, ('moe', moe_a, moe_b), attn_red_a, attn_red_b, mlp_red_a, mlp_red_b))
+                continue
             attention = (PreparedKDA(w["attention"], source, pool.recurrent(index), self.delta,
                 eps=config.text["rms_norm_eps"], records=kda_records.layer(index) if mode == "verify" else None,
                 fused_verify=True, **kwargs) if kind == "kda" else
@@ -591,6 +689,8 @@ class PreparedDecoder:
         # a block commits its running sum when the next block starts.
         size, eps = c["attn_res_block_size"], c["rms_norm_eps"]
         delta, mode = self.embedding.gather(local), REPLACE
+        if self.dual_wave:
+            return self._call_dual_wave(delta, mode, size, eps)
         if self.selection is not None:
             self.selection()
         for index, (w, attention, mlp, reduce) in enumerate(self.layers):
@@ -618,4 +718,185 @@ class PreparedDecoder:
         if self.scoring is not None:
             self.scoring()
         torch.index_select(hidden, 0, m.sample_indices, out=self.scratch.hidden)
+        self.head(self.scratch.hidden)
+
+    def _call_dual_wave(self, delta, mode, size, eps):
+        """Interleave half-chunk (Wave A [0:H], Wave B [H:2H]) SM compute on comp_stream with PCIe DMA rings on main."""
+        half = self.half_tokens
+        main = torch.cuda.current_stream(delta.device)
+        comp = torch.cuda.ExternalStream(self.comp_stream_handle, device=delta.device)
+        res_a = self.residual.substream(0, half)
+        res_b = self.residual.substream(half, 2 * half)
+        attn_in = self.residual.output
+        mlp_in = self.dual_mlp_in
+        total = self.buffers['total'][:2 * half]
+        n_layers = len(self.dual_layers)
+
+        def on_comp(fn):
+            comp.wait_stream(main)
+            with torch.cuda.stream(comp):
+                fn()
+            main.wait_stream(comp)
+
+        def overlap(comm_fn, comp_fn):
+            comp.wait_stream(main)
+            comm_fn()
+            with torch.cuda.stream(comp):
+                comp_fn()
+            main.wait_stream(comp)
+
+        def attn_mix_kwargs(idx, w, wave):
+            committed, boundary = -(-idx // size), idx % size == 0
+            mixture = None
+            if idx in self.auxiliary_layers and self.weights.config.draft.auxiliary_source == 'attention_input':
+                col = self.auxiliary_layers.index(idx) * self.residual.prefix.shape[1]
+                mix_full = self.auxiliary[:, col : col + self.residual.prefix.shape[1]]
+                mixture = mix_full if self.auxiliary_count is not None else (
+                    mix_full[:half] if wave == 0 else mix_full[half:])
+            return dict(
+                sources=committed,
+                write=idx // size if boundary else -1,
+                score=w['attention_res_score'],
+                norm=w['input_layernorm'],
+                eps=eps,
+                output_eps=eps,
+                mixture=mixture,
+                mixture_count=self.auxiliary_count if mixture is not None else None,
+                mixture_window=self.auxiliary_window,
+                mixture_alignment=self.auxiliary_alignment,
+            )
+
+        mix_a_done = False
+        in_a_done = False
+        for index, (w, kind, attention, mlp_spec, attn_red_a, attn_red_b, mlp_red_a, mlp_red_b) in enumerate(self.dual_layers):
+            committed, boundary = -(-index // size), index % size == 0
+            if not mix_a_done:
+                on_comp(lambda w=w, index=index: res_a.mix(delta[:half], mode, **attn_mix_kwargs(index, w, 0)))
+            if kind == 'kda':
+                def finish_kda_core(w=w, index=index, attention=attention, in_a_done=in_a_done):
+                    res_b.mix(delta[half:], mode, **attn_mix_kwargs(index, w, 1))
+                    if not in_a_done:
+                        attention.run_in_half(0, attn_in[:half])
+                    attention.run_in_half(1, attn_in[half:])
+                    attention.run_core()
+                    attention.run_out_half(0)
+                on_comp(finish_kda_core)
+            else:
+                on_comp(lambda w=w, index=index: res_b.mix(delta[half:], mode, **attn_mix_kwargs(index, w, 1)))
+                attention.pre_output(attn_in)
+                on_comp(lambda attention=attention: attention.run_out_half(0))
+
+            overlap(
+                lambda attn_red_a=attn_red_a, attention=attention: attn_red_a(attention.output_buffer[:half]),
+                lambda attention=attention: attention.run_out_half(1),
+            )
+
+            mlp_mode = REPLACE if boundary else ADD
+            mlp_sources = committed + boundary
+            mlp_kind, m_a, m_b = mlp_spec
+            if mlp_kind == 'dense':
+                def run_dense_a(w=w, m_a=m_a):
+                    res_a.mix(total[:half], mlp_mode, sources=mlp_sources, write=-1,
+                              score=w['mlp_res_score'], norm=w['post_attention_layernorm'],
+                              eps=eps, output_eps=eps, output=mlp_in[:half])
+                    m_a(mlp_in[:half])
+                on_comp(run_dense_a)
+                overlap(
+                    lambda attn_red_b=attn_red_b, attention=attention: attn_red_b(attention.output_buffer[half:]),
+                    lambda: None,
+                )
+                def run_dense_b(w=w, m_b=m_b):
+                    res_b.mix(total[half:], mlp_mode, sources=mlp_sources, write=-1,
+                              score=w['mlp_res_score'], norm=w['post_attention_layernorm'],
+                              eps=eps, output_eps=eps, output=mlp_in[half:])
+                    m_b(mlp_in[half:])
+                overlap(
+                    lambda mlp_red_a=mlp_red_a, m_a=m_a: mlp_red_a(m_a.down.output),
+                    run_dense_b,
+                )
+                next_idx = index + 1
+                nw, nkind = self.dual_layers[next_idx][:2]
+                nattn = self.dual_layers[next_idx][2]
+                def pre_next_a(nw=nw, nkind=nkind, nattn=nattn, next_idx=next_idx):
+                    res_a.mix(total[:half], ADD, **attn_mix_kwargs(next_idx, nw, 0))
+                    if nkind == 'kda':
+                        nattn.run_in_half(0, attn_in[:half])
+                overlap(
+                    lambda mlp_red_b=mlp_red_b, m_b=m_b: mlp_red_b(m_b.down.output),
+                    pre_next_a,
+                )
+                delta, mode = total, ADD
+                mix_a_done = True
+                in_a_done = nkind == 'kda'
+                continue
+
+            def prep_moe_a(w=w, m_a=m_a):
+                res_a.mix(total[:half], mlp_mode, sources=mlp_sources, write=-1,
+                          score=w['mlp_res_score'], norm=w['post_attention_layernorm'],
+                          eps=eps, output_eps=eps, output=mlp_in[:half])
+                m_a.phase_down_pack(mlp_in[:half])
+            on_comp(prep_moe_a)
+
+            overlap(m_a.phase_route_ring, lambda m_a=m_a: m_a.shared(mlp_in[:half]))
+
+            def run_exp_a(m_a=m_a):
+                m_a.phase_router()
+                m_a.phase_experts()
+            overlap(
+                lambda attn_red_b=attn_red_b, attention=attention: attn_red_b(attention.output_buffer[half:]),
+                run_exp_a,
+            )
+
+            def prep_moe_b(w=w, m_b=m_b):
+                res_b.mix(total[half:], mlp_mode, sources=mlp_sources, write=-1,
+                          score=w['mlp_res_score'], norm=w['post_attention_layernorm'],
+                          eps=eps, output_eps=eps, output=mlp_in[half:])
+                m_b.phase_down_pack(mlp_in[half:])
+            on_comp(prep_moe_b)
+
+            def run_sh_router_b(m_b=m_b):
+                m_b.shared(mlp_in[half:])
+                m_b.phase_router()
+            overlap(m_b.phase_route_ring, run_sh_router_b)
+
+            m_a.phase_expert_reduce()
+            on_comp(lambda m_a=m_a: m_a.phase_up_combine(m_a.shared.down.output))
+
+            overlap(
+                lambda mlp_red_a=mlp_red_a, m_a=m_a: mlp_red_a(m_a.output),
+                m_b.phase_experts,
+            )
+
+            has_next = index + 1 < n_layers
+            if has_next:
+                nw, nkind, nattn = self.dual_layers[index + 1][:3]
+                overlap(
+                    m_b.phase_expert_reduce,
+                    lambda nw=nw, next_idx=index + 1: res_a.mix(total[:half], ADD, **attn_mix_kwargs(next_idx, nw, 0)),
+                )
+            else:
+                m_b.phase_expert_reduce()
+
+            on_comp(lambda m_b=m_b: m_b.phase_up_combine(m_b.shared.down.output))
+
+            if has_next and nkind == 'kda':
+                overlap(
+                    lambda mlp_red_b=mlp_red_b, m_b=m_b: mlp_red_b(m_b.output),
+                    lambda nattn=nattn: nattn.run_in_half(0, attn_in[:half]),
+                )
+                in_a_done = True
+            else:
+                mlp_red_b(m_b.output)
+                in_a_done = False
+            delta, mode = total, ADD
+            mix_a_done = has_next
+
+        final_sources = -(-n_layers // size)
+        res_a.mix(delta[:half], mode, sources=final_sources, write=-1,
+                  score=self.weights.output_res_score, norm=self.weights.norm, eps=eps, output_eps=eps)
+        res_b.mix(delta[half:], mode, sources=final_sources, write=-1,
+                  score=self.weights.output_res_score, norm=self.weights.norm, eps=eps, output_eps=eps)
+        if self.scoring is not None:
+            self.scoring()
+        torch.index_select(attn_in, 0, self.metadata.sample_indices, out=self.scratch.hidden)
         self.head(self.scratch.hidden)

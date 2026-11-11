@@ -67,7 +67,7 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
                                        "B12X_TRELLIS_SWITCH_SCOPE": "prefill_safe", "B12X_TRELLIS_LUT_CP_ASYNC": "2",
                                        "B12X_TRELLIS_PREFETCH_SIDES": "1", "B12X_TRELLIS_INKERNEL_ROUTE_PACK": "2",
                                        "B12X_TRELLIS_FLOW_FLAGS": "1", "B12X_TRELLIS_TILE_CONFIG": "128,128,64,256",
-                                       "B12X_W4A16_PREFILL_TABLE": "2"}),
+                                       "B12X_W4A16_PREFILL_TABLE": "2", "B12X_W4A16_NONCOOP_PREFILL_SMS": "152"}),
     ranks=MappingProxyType({8: RankCosts(state_row_bytes=63_181_056, page_bytes=2_543_616,
                                        graph_bytes=9 << 29, page_tokens=128 * 8),
                            9: RankCosts(state_row_bytes=58_129_152, page_bytes=2_543_616,
