@@ -188,11 +188,20 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--force-moe-decode-a16", action=argparse.BooleanOptionalAction, default=None,
                           help="use W4A16 target routed experts for decode and verification, with calibrated A4 prefill;"
                                " requires Qwen3.8 Flash NVFP4 on SM120/121 and separate prefill graphs")
-    advanced.add_argument("--prefill-reduction", choices=("fp32-owner-packet", "bf16-gather"),
+    advanced.add_argument("--prefill-reduction", choices=("fp32-owner-packet", "bf16-gather", "bf16-first-hop",
+                                                          "tree-2+2+2+2+1"),
                           help="prefill reduction transport: the lossless ordered FP32 copy-engine ring,"
-                               " or the same FP32 reduce-scatter with one BF16 owner rounding forwarded in"
-                               " the all-gather phase (bit-identical BF16 result, half the gather wire);"
-                               " Kimi K3/K3.1 only")
+                               " the same FP32 reduce-scatter with one BF16 owner rounding forwarded in"
+                               " the all-gather phase (bit-identical BF16 result, half the gather wire),"
+                               " that ring with its first reduce hop, a rank's own BF16 activations, also sent"
+                               " as BF16 (bit-identical),"
+                               " or FP32 sums routed over a PCIe switch tree of four leaf pairs and one"
+                               " single rank with one BF16 rounding per owner (nine ranks; FP32 additions"
+                               " group differently from the ring); Kimi K3/K3.1 only")
+    advanced.add_argument("--prefill-gather", choices=("kernel", "ring"),
+                          help="prefill gather transport: pushes from b12x kernels, or the copy-engine ring"
+                               " that reduces the same graphs for segments of at least half a mebibyte per"
+                               " rank (the same bytes); Kimi K3/K3.1 only")
     advanced.add_argument("--native-dense-activations", action="store_true",
                           help="use quantized activations instead of auto precision for dense projections:"
                                " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")

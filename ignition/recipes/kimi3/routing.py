@@ -11,6 +11,10 @@ the router all-gather, the separate top-k, and the latent all-reduce of the gene
 Given a column-gather channel of the packed shard width, the exchange instead pushes each rank's
 packed row into its peers and every rank unpacks what it received: the paired exchange reads its
 peers' rows through their mappings, one 16-byte transaction at a time from a single block.
+
+When b12x plans the paired exchange itself as a push (one block per row writes the row into every
+peer), that exchange also selects the experts for up to eight rows and clips the padded last shard
+of a world that does not divide the widths, and it is used in place of both forms above.
 """
 
 import itertools
@@ -24,6 +28,9 @@ from b12x.preparation import CollectiveRequirement, PreparedCall
 from ignition.preparation.tuning import declare
 
 MAX_ROWS = 32
+# Smallest per-rank segment a prefill gather moves on the copy-engine ring. Eight ring hops have
+# a fixed cost that kernel pushes do not; below this size the pushes are expected to finish first.
+RING_GATHER_MIN_BYTES = 512 << 10
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
 
@@ -90,16 +97,39 @@ def _copy_rank_major_blocks(destination, received, block):
             destination[:, begin:begin + count].copy_(received[:, full, :count])
 
 
+def _copy_slot_blocks(destination, slots, block, first_rank):
+    """Copy rank blocks of a ring gather into rows.
+
+    `slots` is [world, rows, columns]; slot s holds the columns of rank (first_rank + s) % world,
+    whose first `block` columns belong in destination columns [rank * block, (rank + 1) * block),
+    clipped at the destination's width. Slots of consecutive ranks are copied by one strided copy:
+    at most two runs of whole blocks, and one clipped block.
+    """
+    world, rows, width = slots.shape[0], destination.shape[0], destination.shape[1]
+    full = min(world, width // block)
+    for slot, rank, count in ((0, first_rank, world - first_rank), (world - first_rank, 0, first_rank)):
+        count = min(rank + count, full) - rank
+        if count > 0:
+            view = torch.as_strided(destination[:, rank * block:], (rows, count, block),
+                                    (destination.stride(0), block, 1))
+            view.copy_(slots[slot:slot + count, :, :block].permute(1, 0, 2))
+    if full < world and width > full * block:
+        destination[:, full * block:].copy_(slots[(full - first_rank) % world, :, :width - full * block])
+
+
 class PreparedLatentShardGather:
-    """Gather latent-output column partitions and FP32 router logits in chunks.
+    """Gather latent-output column partitions and FP32 router logits.
 
     Each rank owns output columns of both projections. Router bytes travel in
-    BF16 views without conversion. Serial layers reuse the supplied send and
-    receive buffers; each chunk is consumed before the next overwrites them.
+    BF16 views without conversion. Kernel pushes carry the packed shards in chunks: serial
+    layers reuse the supplied send and receive buffers, and each chunk is consumed before the
+    next overwrites them. Given a copy-engine ring channel whose shard capacity holds the packed
+    shards of all rows, and at least RING_GATHER_MIN_BYTES of them per rank, the shards instead
+    travel that ring whole, packed into and read from the channel's own scratch.
     """
 
     def __init__(self, local_down, local_router, latent, logits, *, runtime,
-                 session, coordinator, name, buffers, allocator=None):
+                 session, coordinator, name, buffers, allocator=None, ring=None):
         from ignition.components.collectives import PreparedAllGather
 
         rows, self.down_columns = local_down.shape
@@ -116,6 +146,13 @@ class PreparedLatentShardGather:
             raise ValueError("latent routing requires matching contiguous BF16 latent and FP32 router partitions")
         self.local_down, self.local_router = local_down, local_router
         self.latent, self.logits = latent, logits
+        self.ring = None
+        if ring is not None and RING_GATHER_MIN_BYTES <= rows * self.columns * 2 <= ring.gather_capacity:
+            from ignition.components.collectives import PreparedRingGather
+
+            self.ring = PreparedRingGather((rows, self.columns), torch.bfloat16, runtime=ring,
+                session=session, coordinator=coordinator, name=name + ".ring")
+            return
         chunk_rows = min(rows, runtime.max_batch_size)
 
         def allocate(field, columns):
@@ -133,6 +170,18 @@ class PreparedLatentShardGather:
             for index, (begin, end) in enumerate(self.bounds)]
 
     def __call__(self):
+        if self.ring is not None:
+            slots = self.ring.slots
+            own = slots[self.world - 1]
+            own[:, :self.down_columns].copy_(self.local_down)
+            own[:, self.down_columns:].copy_(self.local_router.view(torch.bfloat16))
+            self.ring()
+            first = self.ring.first_rank
+            _copy_slot_blocks(self.latent, slots, self.down_columns, first)
+            _copy_slot_blocks(self.logits.view(torch.bfloat16), slots[:, :, self.down_columns:],
+                              2 * self.router_columns, first)
+            self.ring.release()
+            return self.latent
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
             count = end - begin
             self.send[:count, :self.down_columns].copy_(self.local_down[begin:end])
@@ -159,6 +208,21 @@ def create_route_runtime(group, device, *, ipc=None):
     return DcpAllToAll.from_exchange_group(exchange_group=group, device=device, max_batch_size=MAX_ROWS,
         total_heads=world_size, head_dim=8, query_head_dim=2 * latent_width + 4 * router_width,
         stream_affine=False, ipc=ipc)
+
+
+def _selects_in_pushed_exchange(pcie, runtime, local_down, local_router, rows):
+    """Whether b12x plans this channel's paired exchange as a push that also selects `rows` rows' experts.
+
+    The transport is a b12x preparation setting; its plan query reports it. Only that transport runs one
+    block per row, so only it selects experts for more than one row and for padded shards.
+    """
+    query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair",
+        call=dict(local_first=local_down, local_second=local_router, threads=512))
+    if getattr(query, "call", {}).get("pair_transport") != "push":
+        return False
+    from b12x.comm.pcie.pcie_dcp_a2a import PAIR_PUSH_MAX_ROWS
+
+    return rows <= PAIR_PUSH_MAX_ROWS
 
 
 class PreparedRouteGather:
@@ -193,7 +257,8 @@ class PreparedRouteGather:
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         requests = []
         self.fused = self.gather = None
-        if rows == 1 and self.down_width * world == 3584 and self.router_width * world == 896:
+        exact = self.down_width * world == 3584 and self.router_width * world == 896
+        if (rows == 1 and exact) or _selects_in_pushed_exchange(pcie, runtime, local_down, local_router, rows):
             self.fused = dict(local_down=local_down, local_router=local_router, correction_bias=correction_bias,
                               out_down=latent, topk_weights=weights, topk_ids=ids)
             self.plan = pcie.plan(pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair_kimi_topk",

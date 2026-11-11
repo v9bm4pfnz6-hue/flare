@@ -152,7 +152,8 @@ pub struct StoreStats {
     pub held: [u64; 2],
     pub dropped: [u64; 6],
     pub expired: [u64; 2],
-    /// Rows eagerly dropped in DRAM and NVMe, excluding pressure compaction.
+    /// Legacy eager-thinning counters. Child commits retain rows for branch
+    /// restoration; only capacity-pressure compaction now reclaims them.
     pub rows_thinned: [u64; 2],
     /// Successfully stored records using at least one packed share, by DRAM/NVMe tier.
     pub packed_records: [u64; 2],

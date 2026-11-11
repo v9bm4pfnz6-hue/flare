@@ -17,7 +17,7 @@ from ignition.preparation.collective_ladder import resolve as resolve_collective
 
 from . import display, environment
 
-from .preparation import (Host, collective_tuning_mode, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, prefill_reduction_mode, resolve_model, speculation,
+from .preparation import (Host, collective_tuning_mode, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, prefill_gather_mode, prefill_reduction_mode, resolve_model, speculation,
                           stream_overlap, tuning_devices, tuning_effort)
 from .config import Configuration
 
@@ -277,7 +277,7 @@ def _prepare(args):
                       force_moe_decode_a16=configuration.get("preparation.force_moe_decode_a16", args.force_moe_decode_a16).value,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
                       image_concurrency=args.image_concurrency,
-                      prefill_reduction=args.prefill_reduction,
+                      prefill_reduction=args.prefill_reduction, prefill_gather=args.prefill_gather,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                          prefill_graph_capacities=args.prefill_graph_capacities,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
@@ -466,7 +466,8 @@ def debug_serve(args) -> int:
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode,
-                         prefill_reduction=prefill_reduction_mode(configuration, model, args.prefill_reduction))
+                         prefill_reduction=prefill_reduction_mode(configuration, model, args.prefill_reduction),
+                         prefill_gather=prefill_gather_mode(configuration, args.prefill_gather))
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),

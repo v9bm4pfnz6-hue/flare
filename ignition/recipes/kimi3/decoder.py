@@ -10,7 +10,7 @@ import torch
 import triton
 
 from ignition.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce
-from ignition.components.owner_packet_reduce import PreparedOwnerPacketAllReduce, aligned_extent
+from ignition.components.owner_packet_reduce import aligned_extent, copy_engine_reduction
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
@@ -188,7 +188,7 @@ class PreparedMLP:
 class PreparedLatentMoE:
     def __init__(self, weights, source, config, shard, *, runtime, router_runtime, coordinator, session, name, workspace, buffers, storage,
                  route_runtime=None, prefill_route_runtime=None, allocator=None, accumulation_buffers=None,
-                 reduction_staging=None, route_gather_runtime=None):
+                 reduction_staging=None, route_gather_runtime=None, copy_engine=False, gather_ring=None):
         tokens, hidden = source.shape
         c, device = config.text, source.device
         latent = c["routed_expert_hidden_size"]
@@ -215,9 +215,8 @@ class PreparedLatentMoE:
                                       session=session, name=name + ".latent_up", workspace=workspace)
         # Each rank normalizes the full latent row and keeps the columns its up-projection shard reads.
         self.latent_norm, self.eps = weights["latent_norm"], c["rms_norm_eps"]
-        reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedOwnerPacketAllReduce
-        reduction_args = ({} if accumulation_buffers is None
-                          else dict(workspace=accumulation_buffers, staging=reduction_staging))
+        reduction = copy_engine_reduction if copy_engine else PreparedChunkedAllReduce
+        reduction_args = (dict(workspace=accumulation_buffers, staging=reduction_staging) if copy_engine else {})
         self.expert_reduce = reduction(self.expert_output, self.latent_sum, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".expert_reduce", **reduction_args)
         local_logits = buffer("local_router", weights["router"].shape[0], torch.float32)
@@ -249,7 +248,8 @@ class PreparedLatentMoE:
                 self.prefill_route_gather = PreparedLatentShardGather(self.down.output, local_logits,
                     self.latent, logits, runtime=prefill_route_runtime, session=session,
                     coordinator=coordinator, name=name + ".latent_router_gather",
-                    buffers=buffers.setdefault("latent_router_transport", {}), allocator=allocator)
+                    buffers=buffers.setdefault("latent_router_transport", {}), allocator=allocator,
+                    ring=gather_ring)
             else:
                 self.down = prepare_projection(self.source, weights["latent_down"], buffer("down", latent),
                     session=session, name=name + ".latent_down", workspace=workspace)
@@ -318,7 +318,7 @@ class PreparedDecoder:
 
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, vocabulary_runtime, embedding_runtime, router_runtime, vision_state,
                  coordinator, session, name, workspace, buffers, kda_records=None, route_runtime=None, context=None,
-                 latent_runtimes=(), scoring=None, prefill_route_runtime=None):
+                 latent_runtimes=(), scoring=None, prefill_route_runtime=None, ring_gather=False):
         # Verification records its candidate rows; other modes ignore records.
         if mode not in ("prefill", "decode", "verify") or mode == "verify" and kda_records is None:
             raise ValueError("Kimi K3 verification decodes recorded candidate rows")
@@ -330,19 +330,22 @@ class PreparedDecoder:
         from b12x.comm.pcie import DmaAllReduce
 
         reduction_staging = None
-        if isinstance(runtime, DmaAllReduce):
+        copy_engine = isinstance(runtime, DmaAllReduce)
+        if copy_engine:
             if mode != "prefill":
                 raise ValueError("Kimi copy-engine reductions are prepared only for prefill")
             # Size the FP32 packet workspace to the ring-aligned extent, not the raw payload:
             # an unaligned prefill shape otherwise reduces its 64-element alignment tail as a
             # second, fully synchronized ring invocation.
             ring_elements = aligned_extent(source.numel(), runtime.world_size) * runtime.world_size
-            count = min(ring_elements, runtime.max_bytes // 4)
-            key = "prefill_reduction_workspace"
-            if key not in buffers.scratch or buffers.scratch[key].numel() < count:
-                buffers.scratch[key] = (torch.zeros(count, dtype=torch.float32, device=source.device)
-                    if allocator is None else allocator.zeros((count,), torch.float32))
-            accumulation_buffers = buffers.scratch[key]
+            if runtime.tree is None:
+                # A tree channel sums the BF16 activations themselves and needs no FP32 packets.
+                count = min(ring_elements, runtime.max_bytes // 4)
+                key = "prefill_reduction_workspace"
+                if key not in buffers.scratch or buffers.scratch[key].numel() < count:
+                    buffers.scratch[key] = (torch.zeros(count, dtype=torch.float32, device=source.device)
+                        if allocator is None else allocator.zeros((count,), torch.float32))
+                accumulation_buffers = buffers.scratch[key]
             if ring_elements != source.numel():
                 key = "prefill_reduction_staging"
                 if key not in buffers.scratch or buffers.scratch[key].numel() < ring_elements:
@@ -404,7 +407,7 @@ class PreparedDecoder:
                           buffers=self.buffers.setdefault(kind, {}), allocator=buffers.stage_allocator(kind))
             attention = (PreparedKDA(w["attention"], source, pool.recurrent(index), self.delta,
                 eps=config.text["rms_norm_eps"], records=kda_records.layer(index) if mode == "verify" else None,
-                **kwargs) if kind == "kda" else
+                fused_verify=True, **kwargs) if kind == "kda" else
                 PreparedMLA(w["attention"], source, metadata, pool.attention(index), context=context,
                             index_cache=pool.index(index) if kind == "dsa" else None,
                             eps=config.text["rms_norm_eps"],
@@ -436,12 +439,14 @@ class PreparedDecoder:
                     route_gather_runtime=prefill_route_runtime if mode != "prefill" else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace,
                     buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=buffers.stage_allocator("moe"),
-                    accumulation_buffers=accumulation_buffers, reduction_staging=reduction_staging)
+                    accumulation_buffers=accumulation_buffers, reduction_staging=reduction_staging,
+                    copy_engine=copy_engine,
+                    # Large prefill gathers may ride the ring that reduces this graph.
+                    gather_ring=runtime if copy_engine and ring_gather else None)
             # The sum buffer is consumed before the next attention or MLP reduction.
             total = self.buffers["total"][:source.shape[0]]
-            reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedOwnerPacketAllReduce
-            reduction_args = ({} if accumulation_buffers is None
-                              else dict(workspace=accumulation_buffers, staging=reduction_staging))
+            reduction = copy_engine_reduction if copy_engine else PreparedChunkedAllReduce
+            reduction_args = (dict(workspace=accumulation_buffers, staging=reduction_staging) if copy_engine else {})
             reduce = reduction(source, total, runtime=runtime, coordinator=coordinator,
                                session=session, name=prefix + ".reduce", **reduction_args)
             self.layers.append((w, attention, mlp, reduce))

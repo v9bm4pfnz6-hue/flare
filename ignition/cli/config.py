@@ -23,7 +23,7 @@ _SECTIONS = {
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
                  "speculative_token_capacity": int, "speculative_graph_budget": int, "speculative_method": str},
     "memory": {"reserve": str},
-    "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool, "prefill_reduction": str},
+    "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str, "force_moe_decode_a16": bool, "prefill_reduction": str, "prefill_gather": str},
     "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str, "max_age": str,
                      "message_checkpoints": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "package_cache": str, "export_staging": str,
@@ -42,6 +42,7 @@ _BUILT_IN = {
     "preparation.collective_tuning": None,
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
     "preparation.prefill_reduction": "fp32-owner-packet",
+    "preparation.prefill_gather": "kernel",
     "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.drain_on_shutdown": "", "prefix_cache.max_age": "off",
     "prefix_cache.message_checkpoints": "",
     "paths.hub_cache": "~/.cache/huggingface/hub", "paths.kernel_cache": "~/.cache/flare/kernels",
@@ -125,8 +126,12 @@ class Configuration:
                 raise UsageError(f"{path}: message_checkpoints must be one of {', '.join(MESSAGE_CHECKPOINTS)}")
             if key == "autotune_effort" and value not in AUTOTUNE_EFFORTS:
                 raise UsageError(f"{path}: autotune_effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
-            if key == "prefill_reduction" and value not in ("fp32-owner-packet", "bf16-gather"):
-                raise UsageError(f"{path}: prefill_reduction must be fp32-owner-packet or bf16-gather")
+            if key == "prefill_reduction" and value not in ("fp32-owner-packet", "bf16-gather", "bf16-first-hop",
+                                                            "tree-2+2+2+2+1"):
+                raise UsageError(f"{path}: prefill_reduction must be fp32-owner-packet, bf16-gather, bf16-first-hop "
+                                 "or tree-2+2+2+2+1")
+            if key == "prefill_gather" and value not in ("kernel", "ring"):
+                raise UsageError(f"{path}: prefill_gather must be kernel or ring")
             if key == "collective_tuning" and value not in ("static", "runtime"):
                 raise UsageError(f"{path}: collective_tuning must be static or runtime")
             if key == "port" and not 1 <= value <= 65535:

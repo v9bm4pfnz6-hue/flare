@@ -34,10 +34,13 @@
 //! store answers no lookups of its own.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, PoisonError},
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use std::collections::HashSet;
 
 use crate::levels::Rate;
 use crate::{
@@ -199,8 +202,6 @@ struct Core {
     held: HashMap<PrefixKey, usize>,
     /// Records whose moves ended and that leave once nothing reads them.
     finishing: Vec<PrefixKey>,
-    /// Parents whose committed child made their row redundant, waiting for pins.
-    thinning: HashSet<PrefixKey>,
     /// Checksum-backed holdings announced to the pool.
     announced: std::collections::HashSet<PrefixKey>,
 }
@@ -235,7 +236,6 @@ impl Core {
             retiring: Vec::new(),
             held: HashMap::new(),
             finishing: Vec::new(),
-            thinning: HashSet::new(),
             announced: Default::default(),
         }
     }
@@ -613,10 +613,6 @@ impl Core {
                 self.index.set_ready(key, true)?;
                 self.clean_slots += self.clean_slots(&self.index[key]);
             }
-            if let Some(parent) = self.index[key].parent {
-                self.thinning.insert(parent);
-            }
-            self.thin_rows();
             return Ok(());
         }
         self.remove_record(key)
@@ -686,24 +682,6 @@ impl Core {
         }
         self.stats.progress += 1;
         true
-    }
-
-    fn thin(&mut self, key: &PrefixKey) -> bool {
-        let row = self.index.node(key).is_some_and(|node| node.row);
-        let dropped = self.drop_row(key);
-        self.stats.rows_thinned[0] += u64::from(row && dropped);
-        dropped
-    }
-
-    fn thin_rows(&mut self) {
-        for key in std::mem::take(&mut self.thinning) {
-            if !self.index.row_redundant(&key, false) {
-                continue;
-            }
-            if !self.thin(&key) {
-                self.thinning.insert(key);
-            }
-        }
     }
 
     fn mark_durable(&mut self, key: &PrefixKey) -> Result<()> {
@@ -933,7 +911,6 @@ impl Core {
                 self.finish_inbound(inbound, events);
             }
         }
-        self.thin_rows();
     }
 
     fn finish_outbound(&mut self, outbound: Outbound, events: &mut Vec<StoreEvent>) {
@@ -1281,10 +1258,6 @@ impl MemoryStore {
     /// The slots of a ready record.
     pub fn record(&self, key: &PrefixKey) -> Option<&MemoryRecord> {
         self.core.record(key)
-    }
-
-    pub(crate) fn drop_row(&mut self, key: &PrefixKey) -> bool {
-        self.core.thin(key)
     }
 
     /// Remove an unpinned childless record and release its slots.
@@ -1816,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_rows_thin_to_root_and_tip_and_restore_through_page_carriers() {
+    fn conversation_rows_remain_available_for_intermediate_branch_restore() {
         let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
         let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
         let mut store = MemoryStore::new(IDENTITY, host_pool(32), copier).unwrap();
@@ -1842,20 +1815,20 @@ mod tests {
             store.poll(&mut events).unwrap();
             assert_eq!(
                 store.core.index.nodes().filter(|n| n.row).count(),
-                (turn as usize).min(2)
+                turn as usize
             );
             assert_clean_slots(&store.core);
         }
-        assert_eq!(store.pool().slot_count() - store.pool().free_slots(), 10);
-        assert_eq!(store.stats().rows_thinned, [6, 0]);
-        for (tokens, expected) in [(8 * PT, 8 * PT), (7 * PT, PT)] {
+        assert_eq!(
+            store.pool().slot_count() - store.pool().free_slots(),
+            8 + 8 * store.layout().row_slots()
+        );
+        assert_eq!(store.stats().rows_thinned, [0, 0]);
+        for (tokens, expected) in [(8 * PT, 8 * PT), (7 * PT, 7 * PT), (6 * PT, 6 * PT)] {
             let hit = store.lookup(&history(tokens, 1), 0, u64::MAX).unwrap();
             assert_eq!(hit.consumed_tokens, expected);
-            // A rewind resumes at the root and re-prefills the remaining tokens.
-            assert_eq!(
-                tokens - hit.consumed_tokens,
-                if tokens == 7 * PT { 6 * PT } else { 0 }
-            );
+            // Every committed endpoint remains available for a later branch.
+            assert_eq!(tokens, hit.consumed_tokens);
             store
                 .fetch(
                     hit.clone(),
@@ -1887,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn thinning_waits_for_commit_and_pins_and_preserves_existing_branches() {
+    fn row_retention_and_pressure_compaction_respect_pins_and_branches() {
         let layout = Layout::new(&[geometry(PT, &[("kv", PAGE)], 3 * PAGE)]).unwrap();
         let mut core = Core::new(IDENTITY, host_pool(64), layout, false);
         let full = history(320, 1);
@@ -1908,8 +1881,20 @@ mod tests {
         finish(&mut core);
         assert!(core.index[&parent.key].row);
         let before = core.pool.free_slots();
+        assert!(
+            core.index
+                .evict(true, |node| node.key == parent.key)
+                .is_none()
+        );
         core.unpin_record(&parent.key).unwrap();
         core.settle(&mut Vec::new());
+        assert_eq!(core.pool.free_slots(), before);
+        assert!(core.record(&parent.key).unwrap().row.is_some());
+        assert!(matches!(
+            core.index.evict(true, |node| node.key == parent.key),
+            Some(Eviction::Compacted(key)) if key == parent.key
+        ));
+        assert!(core.drop_row(&parent.key));
         assert_eq!(core.pool.free_slots(), before + 3);
         assert!(core.record(&parent.key).unwrap().row.is_none());
         assert_eq!(core.record(&parent.key).unwrap().pages.len(), 1);
@@ -1944,7 +1929,7 @@ mod tests {
         finish(&mut core);
         assert_eq!(
             core.lookup(&history(256, 1), 0, u64::MAX).unwrap().key,
-            child.key
+            leaf.key
         );
         assert_clean_slots(&core);
     }
@@ -2773,11 +2758,11 @@ mod tests {
             stored(&finish(&mut core)),
             [(grandchild.key, Some(3 * PAGE + ROW))]
         );
-        // Commit thins the child: nine page slots and the tip's one row slot
-        // occupy ten of twelve warm slots. The root's row was already freed.
-        assert!(core.record(&child.key).unwrap().row.is_none());
+        // Commit alone preserves the child's row for a later branch; only the
+        // allocation-time pressure compaction freed the root's row.
+        assert!(core.record(&child.key).unwrap().row.is_some());
         assert!(core.record(&grandchild.key).unwrap().row.is_some());
-        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
+        assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 1);
 
         // With nothing else evictable the publication is skipped rather than
         // stored at its parent's expense, and the parent's pin is released.
@@ -2789,6 +2774,7 @@ mod tests {
         assert!(core.index.contains(&grandchild.key));
         assert!(!core.index.node(&grandchild.key).unwrap().pinned());
         assert_eq!(core.index.len(), 3);
+        assert!(core.record(&child.key).unwrap().row.is_none());
         assert_eq!(core.pool.free_slots(), core.pool.intake_slots() + 2);
         assert_clean_slots(&core);
     }

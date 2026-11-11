@@ -9,7 +9,8 @@ from ignition.preparation.scratch import ScratchArena
 
 from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
-from ignition.components.distributed_topk import PreparedDistributedTopK, selected_local_records
+from ignition.components.distributed_topk import (PreparedDistributedTopK, PreparedScoreExchangeTopK,
+                                                  selected_local_records)
 from ignition.components.fp8_indexer import PreparedFP8Indexer
 
 from .config import PAGE_TOKENS
@@ -71,8 +72,9 @@ class PreparedDSA:
         self.gathered_context = mode == "prefill" and context is not None and context.prefill_layout == "ckv"
         self.context, self.peers = context, peers
         if self.gathered_context:
-            if metadata.starts.numel() != 1 or peers is None or context.slab is None:
-                raise ValueError("gathered DSA prefill requires one request and a shared context slab")
+            if metadata.starts.numel() != 1 or peers is None or context.slab is None or context.candidates is None:
+                raise ValueError("gathered DSA prefill requires one request, a shared context slab and a "
+                                 "candidate channel")
             self.window = torch.zeros(2, dtype=torch.int64, device=query.device)
         self.metadata, self.query, self.output, self.slots = metadata, query, output, slots
         self.query_residual = query_residual
@@ -161,11 +163,19 @@ class PreparedDSA:
                 session=session, name=stage_name + ".index", workspace=workspace, buffers=cursor,
                 scores=scores, rotation="none")
             merge = None
-            if self.shards.world > 1:
+            if self.shards.world > 1 and self.gathered_context:
+                # A rank that attends over the gathered context reads every selected position.
                 merge = PreparedDistributedTopK(local, scores, selected,
                     world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
                     session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor,
-                    workspace=workspace)
+                    workspace=workspace, fused_merge=True)
+            elif self.shards.world > 1:
+                # A rank that attends over its own records reads only its share of the selection, which
+                # the scores of every rank's candidates determine: half the bytes of score and position pairs.
+                merge = PreparedScoreExchangeTopK(local, scores, selected,
+                    world=self.shards.world, rank=self.shards.index, runtime=context.selections,
+                    session=session, coordinator=coordinator, name=stage_name + ".candidate_scores",
+                    buffers=cursor, workspace=workspace)
             gather = combine = paired = branch = None
             q, attended = query[begin:end], output[begin:end]
             if self.gathered_context:

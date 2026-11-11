@@ -227,18 +227,6 @@ impl<L> Index<L> {
         self.nodes.get_mut(key)
     }
 
-    /// Whether a row is redundant in this tier; disk counts only committed children.
-    pub fn row_redundant(&self, key: &PrefixKey, ready_only: bool) -> bool {
-        self.node(key).is_some_and(|node| {
-            node.parent.is_some()
-                && if ready_only {
-                    node.ready_children == 1
-                } else {
-                    node.children == 1
-                }
-        })
-    }
-
     pub fn nodes(&self) -> impl Iterator<Item = &Node<L>> {
         self.nodes.values()
     }
@@ -897,33 +885,6 @@ mod tests {
                 .is_err()
         );
         assert_eq!(index.node(&missing).unwrap().children(), 1);
-    }
-
-    #[test]
-    fn row_redundancy_tracks_commits_replacements_and_removed_children() {
-        let mut index = Index::new(64);
-        let full = history(256);
-        insert(&mut index, &full, 64, None);
-        insert(&mut index, &full, 128, Some(64));
-        insert(&mut index, &full, 192, Some(128));
-        let root = full.key_at(64).unwrap();
-        let parent = full.key_at(128).unwrap();
-        let child = full.key_at(192).unwrap();
-        assert!(!index.row_redundant(&root, true));
-        assert!(index.row_redundant(&parent, true));
-        index.set_ready(&child, false).unwrap();
-        assert!(!index.row_redundant(&parent, true));
-        assert!(index.row_redundant(&parent, false));
-        insert(&mut index, &full, 256, Some(128));
-        assert!(index.row_redundant(&parent, true));
-        assert!(!index.row_redundant(&parent, false));
-        index.remove_node(&full.key_at(256).unwrap()).unwrap();
-        assert!(!index.row_redundant(&parent, true));
-        index.set_ready(&child, true).unwrap();
-        assert!(index.row_redundant(&parent, true));
-        index.drop_row(&parent);
-        assert_eq!(index.remove(&child).unwrap().len(), 2);
-        assert_eq!(index[&root].ready_children, 0);
     }
 
     #[test]

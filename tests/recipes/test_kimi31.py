@@ -90,7 +90,15 @@ def test_gather_thread_tuning_keeps_other_kimi_collective_settings():
     assert KIMI3.b12x_environment["B12X_PCIE_DCP_THREADS"] == "512"
     assert RECIPE.b12x_environment == {**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0",
                                        "B12X_PCIE_DCP_BLOCK_LIMIT": "64", "B12X_W4A16_PREFILL_SHAPES": "1",
-                                       "B12X_W4A16_SMALL_M_SPLITK": "decode"}
+                                       "B12X_W4A16_SMALL_M_SPLITK": "decode",
+                                       "B12X_PCIE_DCP_PAIR_PUSH": "1", "B12X_PCIE_DCP_GATHER_ACQUIRE": "1",
+                                       "B12X_PCIE_DCP_GATHER_ISLAND": "2", "B12X_PCIE_DCP_LSE_PUSH_TP9": "2",
+                                       "B12X_TRELLIS_SWITCH_SCOPE": "decode", "B12X_TRELLIS_LUT_CP_ASYNC": "2",
+                                       "B12X_TRELLIS_PREFETCH_SIDES": "1", "B12X_TRELLIS_INKERNEL_ROUTE_PACK": "2",
+                                       "B12X_TRELLIS_FLOW_FLAGS": "1", "B12X_TRELLIS_TILE_CONFIG": "128,128,64,256",
+                                       "B12X_W4A16_PREFILL_TABLE": "1"}
+    assert not any(name.startswith(("B12X_TRELLIS", "B12X_PCIE_DCP_PAIR", "B12X_PCIE_DCP_GATHER", "B12X_PCIE_DCP_LSE"))
+                   for name in KIMI3.b12x_environment)
     assert "B12X_W4A16_PREFILL_SHAPES" not in KIMI3.b12x_environment
     assert "B12X_W4A16_SMALL_M_SPLITK" not in KIMI3.b12x_environment
     assert RECIPE.b12x_environment["B12X_PCIE_DCP_BLOCK_LIMIT"] == "64"
@@ -316,6 +324,55 @@ def test_tp9_route_gather_pushes_packed_shards_through_a_column_channel(monkeypa
                   dict(max_batch_size=rows - 1)):
         with pytest.raises(ValueError, match="column channel"):
             make(rows, {}, None, gather_runtime=SimpleNamespace(**{**vars(channel), **wrong}))
+
+
+@pytest.mark.parametrize(("rows", "fused"), ((1, True), (4, True), (8, True), (9, False), (32, False)))
+def test_tp9_route_gather_selects_inside_a_pushed_paired_exchange(monkeypatch, rows, fused):
+    import sys
+    import torch
+    from types import SimpleNamespace
+    from b12x.comm import pcie
+    from ignition.components import collectives
+    from ignition.recipes.kimi3 import routing
+    from ignition.recipes.kimi3.config import padded_width
+
+    down_width = padded_width(3584, 9, 32)
+    router_width = padded_width(896, 9, 8)
+    runtime = SimpleNamespace(world_size=9, query_head_dim=2 * down_width + 4 * router_width,
+                              exchange_group=object())
+    channel = SimpleNamespace(world_size=9, heads_per_rank=1, query_head_dim=down_width + 2 * router_width,
+                              max_batch_size=1024)
+    declared, planned, gathers = [], [], []
+    plan = SimpleNamespace(request=lambda **kwargs: kwargs["name"])
+
+    def query(runtime, *, surface, call):
+        # b12x marks the paired surfaces of a push plan; other surfaces carry no transport.
+        pair = surface.endswith(("all_gather_pair", "all_gather_pair_kimi_topk"))
+        return SimpleNamespace(surface=surface, call={"pair_transport": "push"} if pair else {})
+
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: tuple(range(9)))
+    monkeypatch.setattr(pcie, "query_from_runtime", query)
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: planned.append(query.surface) or plan)
+    monkeypatch.setattr(routing, "declare", lambda session, requests, **kwargs: declared.extend(requests))
+    monkeypatch.setitem(sys.modules, "b12x.comm.pcie.pcie_dcp_a2a", SimpleNamespace(PAIR_PUSH_MAX_ROWS=8))
+    monkeypatch.setattr(collectives, "PreparedAllGather",
+                        lambda source, output, **kwargs: gathers.append(kwargs["name"]) or object())
+
+    gather = routing.PreparedRouteGather(
+        torch.zeros((rows, down_width), dtype=torch.bfloat16),
+        torch.zeros((rows, router_width), dtype=torch.float32), torch.zeros(896, dtype=torch.float32),
+        torch.zeros((rows, 3584), dtype=torch.bfloat16), torch.zeros((rows, 16), dtype=torch.float32),
+        torch.zeros((rows, 16), dtype=torch.int32), runtime=runtime, session=None, coordinator=None,
+        name="route", buffers={}, gather_runtime=channel)
+
+    if fused:
+        # One exchange gathers the padded shards and selects: no separate selection, no column channel.
+        assert gather.fused is not None and gather.gather is None
+        assert planned == ["DcpAllToAll.all_gather_pair_kimi_topk"] and declared == ["route"] and not gathers
+        assert gather.fused["out_down"].shape == (rows, 3584)
+    else:
+        assert gather.fused is None and gather.gather is not None
+        assert planned == ["DcpAllToAll.kimi_topk16"] and declared == ["route/select"] and gathers == ["route/gather"]
 
 
 def test_route_unpack_geometry_matches_rank_major_compaction():

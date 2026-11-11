@@ -58,6 +58,65 @@ def _pack_local_candidates(indices, scores, local, rank, world):
             TOPK=topk, WORLD=world, BLOCK=1024, num_warps=4)
 
 
+@triton.jit
+def _pack_keys(Indices, Scores, Keys, row_stride, TOPK: tl.constexpr, BLOCK: tl.constexpr):
+    # One key per candidate slot: the score of a candidate, -inf for a slot without one. A NaN
+    # score does not compare greater than -inf, so it never reaches the row top-k.
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    columns = block * BLOCK + tl.arange(0, BLOCK)
+    mask = columns < TOPK
+    index = tl.load(Indices + row * row_stride + columns, mask=mask, other=-1)
+    score = tl.load(Scores + row * row_stride + columns, mask=mask, other=-float('inf'))
+    live = (index >= 0) & (score > -float('inf'))
+    tl.store(Keys + row * TOPK + columns, tl.where(live, score, -float('inf')), mask=mask)
+
+
+def _pack_local_keys(indices, scores, keys):
+    """Write this rank's candidate keys for the score exchange."""
+    rows, topk = indices.shape
+    if (indices.dtype != torch.int32 or scores.dtype != torch.float32 or scores.shape != indices.shape
+            or indices.stride(0) != scores.stride(0) or indices.stride(1) != 1 or scores.stride(1) != 1
+            or keys.dtype != torch.float32 or keys.shape != (rows, topk) or not keys.is_contiguous()):
+        raise ValueError("key packing requires matching int32/FP32 candidate rows and contiguous FP32 keys")
+    _launch(_pack_keys, (rows, triton.cdiv(topk, 1024)), (indices, scores, keys, indices.stride(0)),
+            TOPK=topk, BLOCK=1024, num_warps=4)
+
+
+class PreparedScoreExchangeTopK:
+    """Each rank's share of the global top-k, from an exchange of scores only.
+
+    The ranks gather one FP32 score per candidate slot, half of what score/ID pairs take, and
+    each selects among its own candidates (PreparedCandidateShare). The output row holds the
+    global positions of this rank's selected candidates and -1 elsewhere: for finite scores the
+    rows of PreparedDistributedTopK restricted to this rank, which is all a consumer that maps
+    the selection to its own records reads. `runtime` gathers 2 * k BF16 columns per rank.
+    """
+
+    def __init__(self, indices, scores, output, *, world, rank, runtime, session, coordinator,
+                 name, buffers, workspace):
+        from ignition.components.candidate_share import PreparedCandidateShare
+
+        if (indices.ndim != 2 or indices.dtype != torch.int32 or scores.shape != indices.shape
+                or scores.dtype != torch.float32 or output.shape != indices.shape or output.dtype != indices.dtype
+                or world < 2 or rank.shape != (1,) or rank.dtype != torch.int64):
+            raise ValueError("distributed top-k requires matching int32 positions, FP32 scores and a rank tensor")
+        rows, self.topk = indices.shape
+        self.indices, self.scores, self.output = indices, scores, output
+        self.keys = buffers.zeros((rows, self.topk), torch.float32)
+        self.gathered = buffers.zeros((rows, world * self.topk), torch.float32)
+        self.share = PreparedCandidateShare(self.gathered, indices, scores, rank, output, world=world,
+            session=session, workspace=workspace, name=name + ".share")
+        self.collective = PreparedAllGather(self.keys, self.gathered, runtime=runtime, session=session,
+            coordinator=coordinator, name=name)
+
+    def __call__(self):
+        _pack_local_keys(self.indices, self.scores, self.keys)
+        self.collective(self.keys)
+        self.share()
+        return self.output
+
+
 class PreparedDistributedTopK:
     """Merge each rank's local top-k into global logical positions.
 
@@ -68,7 +127,7 @@ class PreparedDistributedTopK:
     """
 
     def __init__(self, indices, scores, output, *, world, rank, runtime, session, coordinator,
-                 name, buffers, workspace):
+                 name, buffers, workspace, fused_merge=False):
         if (indices.ndim != 2 or indices.dtype != torch.int32 or scores.shape != indices.shape
                 or scores.dtype != torch.float32 or output.shape != indices.shape or output.dtype != indices.dtype
                 or world < 2 or rank.shape != (1,) or rank.dtype != torch.int64):
@@ -79,7 +138,7 @@ class PreparedDistributedTopK:
         self.local = buffers.zeros((rows, self.topk, 2), torch.float32)
         self.gathered = buffers.zeros((rows, world * self.topk, 2), torch.float32)
         self.merge = PreparedCandidateMerge(self.gathered, output, session=session,
-            workspace=workspace, name=name + ".merge")
+            workspace=workspace, name=name + ".merge", fused=fused_merge)
         self.collective = PreparedAllGather(self.local.view(torch.bfloat16).view(rows, -1),
             self.gathered.view(torch.bfloat16).view(rows, -1), runtime=runtime, session=session,
             coordinator=coordinator, name=name)

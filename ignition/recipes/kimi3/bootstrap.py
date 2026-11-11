@@ -117,17 +117,29 @@ class PreparationConfig:
     # ring. "bf16-gather" runs the same ordered FP32 reduce-scatter and forwards a single BF16
     # rounding of each fully reduced owner chunk in the all-gather phase: the serving BF16
     # activations are bit-identical and the all-gather wire carries half the bytes.
+    # "bf16-first-hop" is the "bf16-gather" ring whose first reduce hop also travels as BF16: that hop
+    # carries a rank's own activations, which are BF16 values, and the receiver forms the same FP32 sum.
+    # "tree-2+2+2+2+1" routes the reduction over the PCIe switch tree of nine ranks on four leaf
+    # pairs and one single rank: BF16 values to the rank that sums them, FP32 partial sums to the
+    # owner, one BF16 rounding per owner. Same arithmetic precision; the FP32 additions group
+    # by leaf instead of by ring order, so results are not bit-identical to the ring's.
     prefill_reduction: str = "fp32-owner-packet"
+    # Prefill gather transport. "kernel" pushes every gather from b12x kernels. "ring" moves the
+    # latent and router shards of a graph that reduces on the copy-engine ring over that ring when
+    # a rank's segment is at least half a mebibyte: the same bytes, through the channel's scratch.
+    prefill_gather: str = "kernel"
     # Ranks share each page's context (decode context parallel over every rank, KV interleave 1).
     context_parallel: bool = True
     # The MoonViT encoder and its graphs prepare beside the text model unless the plan serves text only.
     vision: bool = True
 
     def __post_init__(self):
-        if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather"):
+        if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather", "bf16-first-hop", "tree-2+2+2+2+1"):
             raise ValueError(
-                "prefill reduction must be fp32-owner-packet or bf16-gather"
+                "prefill reduction must be fp32-owner-packet, bf16-gather, bf16-first-hop or tree-2+2+2+2+1"
             )
+        if self.prefill_gather not in ("kernel", "ring"):
+            raise ValueError("prefill gather must be kernel or ring")
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
             raise ValueError("Kimi draft head conversion must be mxfp8 or nvfp4")
         if self.draft_head_quantization is not None and not self.drafting:
@@ -294,7 +306,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         prefill_collective = (create_dma_all_reduce_runtime(group, device,
             max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
             ipc=package_storage.peer_storage, wire_mode="",
-            bf16_gather=config.prefill_reduction == "bf16-gather") if dma_prefill else
+            bf16_gather=config.prefill_reduction in ("bf16-gather", "bf16-first-hop"),
+            bf16_first_hop=config.prefill_reduction == "bf16-first-hop",
+            tree=(config.prefill_reduction.removeprefix("tree-")
+                  if config.prefill_reduction.startswith("tree-") else None)) if dma_prefill else
             create_single_round_all_reduce_runtime(group, device,
                 max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
                 ipc=package_storage.peer_storage)
@@ -363,12 +378,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                            query_head_dim=RECORD_BYTES, ipc=package_storage.peer_storage),
                 coordinator=coordinator,
                 peers=pool.share_pages(package_storage, group), slab=None,
-                candidates=(create_all_gather_runtime(group, device, max_rows=selection_rows,
-                    columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None),
                 prefill_layout="query_split" if sparse else "dcp",
                 index_peers=pool.share_pages(package_storage, group, suffix=".index") if sparse else None,
+                # Prefill gathers selected positions on this channel, and decode and verification the candidate
+                # scores of their rows: 2 * TOPK BF16 columns per rank either way.
                 selections=(create_all_gather_runtime(group, device,
-                    max_rows=min(32, (config.prefill_chunk_size + shard.world_size - 1) // shard.world_size),
+                    max_rows=max(selection_rows,
+                                 min(32, (config.prefill_chunk_size + shard.world_size - 1) // shard.world_size)),
                     columns=2 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
             from ignition.components.weights import OutputPartitionedBF16Weight
             if any(isinstance(layer["attention"].get("index_query"), OutputPartitionedBF16Weight)
@@ -533,7 +549,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
                         session=session, name=name, workspace=arena, buffers=decoder_buffers,
-                        **dict(collectives, runtime=prefill_runtime))
+                        **dict(collectives, runtime=prefill_runtime),
+                        ring_gather=mode == "prefill" and config.prefill_gather == "ring")
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)
