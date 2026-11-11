@@ -250,7 +250,7 @@ class SpeculativePreparation:
         self.draft_temperature = draft_temperature
         layers = {i: w["attention"] for i, w in enumerate(weights.layers) if weights.config.layers[i] == "kda"}
         heads = padded_width(weights.config.text["linear_attn_config"]["num_heads"], weights.shard.world_size)
-        self.kda_records = KDARecords.allocate(layers, requests.capacity+1, heads, pool.backing.device)
+        self.kda_records = KDARecords.allocate(layers, requests.capacity+1, heads, pool.backing.device, window=draft_tokens+1)
         def decoder(weights, tables, scratch, metadata, pool, *, mode, **kwargs):
             return PreparedDecoder(weights, scratch, metadata, pool, mode=mode, buffers=decoder_buffers,
                 kda_records=self.kda_records if mode == "verify" else None, **{**collectives, **kwargs})

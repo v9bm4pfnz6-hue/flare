@@ -59,7 +59,7 @@ class PreparedDSA:
     def __init__(self, weights, query_residual, key_input, weight_input, query, output, slots,
                  metadata, cache, index_cache, *, context, session, coordinator, name, workspace,
                  buffers, allocator=None, eps=1e-5, mode="decode", latent=None, peers=None, index_peers=None,
-                 selection=None):
+                 selection=None, gather_ring=None):
         self.prefill = None
         if mode == "prefill" and context is not None and context.prefill_layout == "query_split":
             from .dsa_prefill import PreparedGatheredDSA
@@ -67,7 +67,7 @@ class PreparedDSA:
             self.prefill = PreparedGatheredDSA(weights, query_residual, key_input, weight_input,
                 query, output, slots, metadata, cache, index_cache, context=context, session=session,
                 coordinator=coordinator, name=name, workspace=workspace, buffers=buffers,
-                latent=latent, peers=peers, index_peers=index_peers, eps=eps)
+                latent=latent, peers=peers, index_peers=index_peers, eps=eps, gather_ring=gather_ring)
             return
         self.gathered_context = mode == "prefill" and context is not None and context.prefill_layout == "ckv"
         self.context, self.peers = context, peers

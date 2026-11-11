@@ -134,9 +134,10 @@ class PreparationConfig:
     vision: bool = True
 
     def __post_init__(self):
-        if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather", "bf16-first-hop", "tree-2+2+2+2+1"):
+        if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather", "bf16-first-hop",
+                                          "bf16-direct", "fp24-ring", "mxfp16-ring", "tree-2+2+2+2+1"):
             raise ValueError(
-                "prefill reduction must be fp32-owner-packet, bf16-gather, bf16-first-hop or tree-2+2+2+2+1"
+                "prefill reduction must be fp32-owner-packet, bf16-gather, bf16-first-hop, bf16-direct, fp24-ring, mxfp16-ring or tree-2+2+2+2+1"
             )
         if self.prefill_gather not in ("kernel", "ring"):
             raise ValueError("prefill gather must be kernel or ring")
@@ -308,6 +309,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             ipc=package_storage.peer_storage, wire_mode="",
             bf16_gather=config.prefill_reduction in ("bf16-gather", "bf16-first-hop"),
             bf16_first_hop=config.prefill_reduction == "bf16-first-hop",
+            bf16_direct=config.prefill_reduction == "bf16-direct",
+            fp24_ring=config.prefill_reduction == "fp24-ring",
+            mxfp16_ring=config.prefill_reduction == "mxfp16-ring",
             tree=(config.prefill_reduction.removeprefix("tree-")
                   if config.prefill_reduction.startswith("tree-") else None)) if dma_prefill else
             create_single_round_all_reduce_runtime(group, device,
@@ -343,6 +347,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         router_columns = 2 * shard.world_size * ((local_router + 31) // 32 * 32)
         router_collective = create_all_gather_runtime(group, device, max_rows=prefill_gather_rows,
             columns=router_columns, ipc=package_storage.peer_storage)
+        norm_stats_collective = (create_all_gather_runtime(group, device,
+            max_rows=max(1, -(-config.prefill_chunk_size // 32)), columns=64 * shard.world_size,
+            ipc=package_storage.peer_storage)
+            if dma_prefill and config.prefill_reduction in ("bf16-direct", "fp24-ring", "mxfp16-ring") and shard.world_size > 1
+            else None)
         vision_collectives = {}
         if config.vision and weights.vision.shard.world_size > 1:
             from .vision import HEAD_SIZE, INTERMEDIATE, VISION_HEADS
@@ -501,7 +510,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
         route_runtime=route_collective, prefill_route_runtime=prefill_route_collective,
         vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
-        vision_state=vision_state, context=context, latent_runtimes=latent_runtimes)
+        vision_state=vision_state, context=context, latent_runtimes=latent_runtimes,
+        stats_runtime=norm_stats_collective)
     speculation = None
     if drafting:
         from .dspark import SpeculativePreparation

@@ -73,7 +73,13 @@ class ScratchArena:
 
             # PyTorch's round-robin stream pool can alias a later capture stream.
             with torch.cuda.device(self.device):
-                status, handle = cuda.cuStreamCreate(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING)
+                p_status, least_prio, _ = cuda.cuCtxGetStreamPriorityRange()
+                if p_status == cuda.CUresult.CUDA_SUCCESS:
+                    status, handle = cuda.cuStreamCreateWithPriority(
+                        cuda.CUstream_flags.CU_STREAM_NON_BLOCKING, int(least_prio)
+                    )
+                else:
+                    status, handle = cuda.cuStreamCreate(cuda.CUstream_flags.CU_STREAM_NON_BLOCKING)
                 if status != cuda.CUresult.CUDA_SUCCESS:
                     raise RuntimeError(f"cannot create overlap stream: {status}")
                 stream = torch.cuda.ExternalStream(int(handle), device=self.device)

@@ -71,22 +71,34 @@ class ContextShards:
 @triton.jit
 def _pull_context(Addresses, Table, Window, Slab, columns, WORLD: tl.constexpr, PAGE: tl.constexpr,
                   TOKENS: tl.constexpr, WORDS: tl.constexpr, WORD_BLOCK: tl.constexpr):
-    # Copy the records of global positions in [Window[0], Window[1]) into the slab from its first row, reading
-    # each from its owner's cache: this rank's own memory or a peer's through CUDA IPC.
-    first = tl.program_id(0) * TOKENS
+    # Persistent owner-partitioned pull: each CTA serves one owner rank so consecutive reads hit
+    # adjacent local records of the same peer GPU, and cold prompts (begin >= end) exit in 576 CTAs
+    # instead of 65,536.
     begin = tl.load(Window).to(tl.int64)
     end = tl.load(Window + 1).to(tl.int64)
-    if begin + first < end:
-        word = tl.arange(0, WORD_BLOCK)
+    if begin >= end:
+        return
+    pid = tl.program_id(0).to(tl.int64)
+    num_programs = tl.num_programs(0).to(tl.int64)
+    owner = pid % WORLD
+    worker = pid // WORLD
+    workers_per_owner = tl.maximum(num_programs // WORLD, 1)
+    source = tl.load(Addresses + owner).to(tl.pointer_type(tl.int32))
+    rem = begin % WORLD
+    delta = (owner - rem + WORLD) % WORLD
+    first_token_for_owner = begin + delta
+    word = tl.arange(0, WORD_BLOCK)
+    base_k = worker * TOKENS
+    step_k = workers_per_owner * TOKENS
+    while first_token_for_owner + base_k * WORLD < end:
         for offset in tl.range(0, TOKENS):
-            token = begin + first + offset
+            token = first_token_for_owner + (base_k + offset) * WORLD
             if token < end:
-                owner = token % WORLD
                 local = token // WORLD
                 page = tl.load(Table + tl.minimum(local // PAGE, columns - 1)).to(tl.int64)
-                source = tl.load(Addresses + owner).to(tl.pointer_type(tl.int32))
                 values = tl.load(source + (page * PAGE + local % PAGE) * WORDS + word, mask=word < WORDS)
-                tl.store(Slab + (first + offset) * WORDS + word, values, mask=word < WORDS)
+                tl.store(Slab + (token - begin) * WORDS + word, values, mask=word < WORDS)
+        base_k += step_k
 
 
 @triton.jit
@@ -119,38 +131,49 @@ def pull_context(addresses, table, window, slab, shards):
     """Copy every rank's records of the positions in `window`, a [begin, end) int64 pair no wider than the slab,
     into the slab [rows, 144] int32 words from its first row."""
     rows = slab.shape[0]
-    _launch(_pull_context, (triton.cdiv(rows, _PULL_TOKENS),), (addresses, table, window, slab, table.shape[0]),
+    grid_ctas = min(max(shards.world, shards.world * 64), max(shards.world, triton.cdiv(rows, _PULL_TOKENS)))
+    grid_ctas = max(shards.world, (grid_ctas // shards.world) * shards.world)
+    _launch(_pull_context, (grid_ctas,), (addresses, table, window, slab, table.shape[0]),
             WORLD=shards.world, PAGE=PAGE_TOKENS, TOKENS=_PULL_TOKENS, WORDS=RECORD_BYTES // 4, WORD_BLOCK=256,
             num_warps=4)
 
 
 @triton.jit
-def _pull_index_context(Addresses, Table, End, Destination, columns,
+def _pull_index_context(Addresses, Table, End, Destination, columns, max_records,
                         WORLD: tl.constexpr, PAGE: tl.constexpr, ROWS: tl.constexpr):
-    # Preserve the original FP8 bytes and FP32 scales in planar 64-record pages.
-    tokens = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-    words = tl.arange(0, 32)
+    # Persistent bounded-grid index pull: exits immediately when End <= 0 instead of 131,072 CTAs.
     end = tl.load(End).to(tl.int64)
-    local = tokens // WORLD
-    live = tokens < end
-    block = local // PAGE
-    page = tl.load(Table + tl.minimum(block, columns - 1), mask=live, other=-1).to(tl.int64)
-    live &= (block < columns) & (page >= 0)
-    source = tl.load(Addresses + tokens % WORLD).to(tl.pointer_type(tl.int32))
-    index_page = page * 2 + local % PAGE // 64
-    src = index_page * (64 * 33) + local % 64 * 32
-    dst = tokens // 64 * (64 * 33) + tokens % 64 * 32
-    keys = tl.load(source[:, None] + src[:, None] + words[None, :], mask=live[:, None], other=0)
-    tl.store(Destination + dst[:, None] + words[None, :], keys, mask=live[:, None])
-    scale = tl.load(source + index_page * (64 * 33) + 64 * 32 + local % 64, mask=live, other=0)
-    tl.store(Destination + tokens // 64 * (64 * 33) + 64 * 32 + tokens % 64, scale, mask=live)
+    limit = tl.minimum(end, max_records.to(tl.int64))
+    if limit <= 0:
+        return
+    pid = tl.program_id(0).to(tl.int64)
+    step = tl.num_programs(0).to(tl.int64) * ROWS
+    words = tl.arange(0, 32)
+    base = pid * ROWS
+    while base < limit:
+        tokens = base + tl.arange(0, ROWS)
+        local = tokens // WORLD
+        live = tokens < limit
+        block = local // PAGE
+        page = tl.load(Table + tl.minimum(block, columns - 1), mask=live, other=-1).to(tl.int64)
+        live &= (block < columns) & (page >= 0)
+        source = tl.load(Addresses + tokens % WORLD).to(tl.pointer_type(tl.int32))
+        index_page = page * 2 + local % PAGE // 64
+        src = index_page * (64 * 33) + local % 64 * 32
+        dst = tokens // 64 * (64 * 33) + tokens % 64 * 32
+        keys = tl.load(source[:, None] + src[:, None] + words[None, :], mask=live[:, None], other=0)
+        tl.store(Destination + dst[:, None] + words[None, :], keys, mask=live[:, None])
+        scale = tl.load(source + index_page * (64 * 33) + 64 * 32 + local % 64, mask=live, other=0)
+        tl.store(Destination + tokens // 64 * (64 * 33) + 64 * 32 + tokens % 64, scale, mask=live)
+        base += step
 
 
 def pull_index_context(addresses, table, end, destination, shards):
     """Copy committed index history into a contiguous, byte-identical planar index cache."""
     records = destination.shape[0] * 64
-    _launch(_pull_index_context, (triton.cdiv(records, 8),),
-            (addresses, table, end, destination.view(torch.int32), table.numel()),
+    grid_ctas = min(512, triton.cdiv(records, 8))
+    _launch(_pull_index_context, (grid_ctas,),
+            (addresses, table, end, destination.view(torch.int32), table.numel(), records),
             WORLD=shards.world, PAGE=PAGE_TOKENS, ROWS=8, num_warps=4)
 
 

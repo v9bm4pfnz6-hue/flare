@@ -30,7 +30,7 @@ FP8 = torch.float8_e4m3fn
 class PreparedMLA:
     def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
                  coordinator=None, context=None, peers=None, allocator=None, index_cache=None, index_peers=None,
-                 eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None, selection=None):
+                 eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None, selection=None, gather_ring=None):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
         device = source.device
@@ -79,11 +79,21 @@ class PreparedMLA:
             self.local = buffer("local", local_width, rows=rows)
             self.gate = self.local[:, width:width + heads * 128]
             # The exchange reads contiguous rows, which a single row's latent columns already are.
-            self.staged = tokens > 1
-            self.send = buffer("send", width, rows=rows) if self.staged else self.local[:, :width]
-            self.gathered_latents = buffer("gathered_latents", world * width, rows=rows)
-            self.latent_gather = PreparedChunkedAllGather(self.send, self.gathered_latents, runtime=latents,
-                session=session, coordinator=coordinator, name=name + ".gather_latents")
+            from .routing import RING_COLUMN_GATHER_MIN_BYTES
+            self.latent_ring = None
+            nbytes = tokens * width * source.element_size()
+            if (gather_ring is not None and world > 1 and nbytes % 16 == 0
+                    and RING_COLUMN_GATHER_MIN_BYTES <= nbytes <= gather_ring.gather_capacity):
+                from ignition.components.collectives import PreparedRingGather
+                self.latent_ring = PreparedRingGather((tokens, width), source.dtype, runtime=gather_ring,
+                    session=session, coordinator=coordinator, name=name + ".gather_latents.ring")
+                self.staged = False
+            else:
+                self.staged = tokens > 1
+                self.send = buffer("send", width, rows=rows) if self.staged else self.local[:, :width]
+                self.gathered_latents = buffer("gathered_latents", world * width, rows=rows)
+                self.latent_gather = PreparedChunkedAllGather(self.send, self.gathered_latents, runtime=latents,
+                    session=session, coordinator=coordinator, name=name + ".gather_latents")
         self.projections = {key: prepare_projection(x, weights[key], y, session=session,
             name=name + "." + key, workspace=workspace)
             for key, x, y in (("latent_gate", source, self.local), ("q_b", self.query_norm, self.query.view(tokens, -1)),
@@ -111,7 +121,8 @@ class PreparedMLA:
                 self.local[:, index_begin + 128:index_begin + 160], self.absorbed, self.attended, self.slots,
                 metadata, cache, index_cache, context=context, session=session, coordinator=coordinator,
                 name=name, workspace=workspace, buffers=buffers.setdefault("selection", {}), allocator=allocator, eps=eps,
-                mode=mode, latent=self.latent, peers=peers, index_peers=index_peers, selection=selection)
+                mode=mode, latent=self.latent, peers=peers, index_peers=index_peers, selection=selection,
+                gather_ring=gather_ring)
         elif world == 1:
             # Every rank holds every record: attend with this rank's heads; b12x quantizes the BF16 query.
             self.lengths = torch.zeros_like(metadata.lengths)
@@ -151,7 +162,18 @@ class PreparedMLA:
     def __call__(self, source):
         p, m, shards = self.projections, self.metadata, self.shards
         p["latent_gate"](source)
-        if self.latent_gather is not None:
+        if getattr(self, 'latent_ring', None) is not None:
+            from .routing import _copy_slot_blocks
+            slots = self.latent_ring.slots
+            world, tokens, width = slots.shape
+            slots[world - 1].copy_(self.local[:, :width])
+            self.latent_ring()
+            first = self.latent_ring.first_rank
+            q, kv = self.local_q, self.local_kv
+            _copy_slot_blocks(self.query_input, slots[:, :, :q], q, first)
+            _copy_slot_blocks(self.kv_input, slots[:, :, q:q + kv], kv, first)
+            self.latent_ring.release()
+        elif self.latent_gather is not None:
             tokens, width = self.send.shape
             if self.staged:
                 self.send.copy_(self.local[:, :width])
@@ -189,7 +211,8 @@ class PreparedMLA:
             self.token_lengths.copy_(shards.local_tokens(m.positions + 1).to(torch.int32))
             self.attention()
             self.combine(self.partial, self.lse)
-        self.expanded.copy_(torch.bmm(self.attended.transpose(0, 1), self.weights["value"]).transpose(0, 1).flatten(1))
+        att_rows, att_heads = self.attended.shape[:2]
+        self.expanded.view(att_rows, att_heads, 128).copy_(torch.bmm(self.attended.transpose(0, 1), self.weights["value"]).transpose(0, 1))
         if self.gated:
             sigmoid_gate(self.expanded, self.gate)
         return p["output"](self.expanded)

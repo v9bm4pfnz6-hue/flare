@@ -117,6 +117,9 @@ class PreparedAllReduce:
             group = runtime.group
 
             def prepare(state):
+                if getattr(runtime, 'direct_mode', ''):
+                    return PreparedCall(run=lambda: state.prime(source, out=output), output=output,
+                                        owners=(runtime, source, output))
                 return PreparedCall(run=lambda: state.run(source, out=output), output=output,
                                     owners=(runtime, source, output))
         elif isinstance(runtime, pcie.PCIeTwoShotBF16):
@@ -195,6 +198,52 @@ class PreparedAllReduce:
             self.output.copy_(source)
             return self.output
         _all_reduce(source, self.output, self.handle)
+        return self.output
+
+
+@torch.library.custom_op("flare::pcie_reduce_scatter", mutates_args=("output",))
+def _reduce_scatter(source: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+    owner = _OWNERS[handle]
+    owner.runtime.reduce_scatter(source, out=output, plan=owner.plan)
+
+
+@_reduce_scatter.register_fake
+def _fake_reduce_scatter(source, output, handle):
+    pass
+
+
+class PreparedReduceScatter:
+    """8-hop reduce-scatter on a direct BF16/FP24 copy-engine ring channel into rank-owned output."""
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name):
+        import torch.distributed as dist
+        from b12x.comm import pcie
+        from b12x.comm.pcie._dma_preparation import query_from_metadata
+
+        if not isinstance(runtime, pcie.DmaAllReduce) or not getattr(runtime, 'direct_mode', ''):
+            raise ValueError("PreparedReduceScatter requires a direct BF16/FP24 DMA ring channel")
+        world = runtime.world_size
+        if (source.dtype != torch.bfloat16 or output.dtype != torch.bfloat16
+                or not source.is_contiguous() or not output.is_contiguous()
+                or source.numel() != output.numel() * world
+                or source.numel() % (world * 128) != 0):
+            raise ValueError("PreparedReduceScatter requires contiguous 128-aligned BF16 source [world, ...] and output [...]")
+        self.runtime, self.output = runtime, output
+        self.plan = pcie.plan(query_from_metadata(runtime, shape=tuple(source.shape), dtype=source.dtype),
+                              runtime=runtime)
+        ranks = tuple(dist.get_process_group_ranks(runtime.group))
+
+        def prepare(state):
+            return PreparedCall(run=lambda: state.prime_reduce_scatter(source, out=output), output=output,
+                                owners=(runtime, source, output))
+
+        declare(session, (self.plan.request(name=name, prepare_call=prepare,
+            collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
+        self.handle = next(_HANDLES)
+        _OWNERS[self.handle] = self
+
+    def __call__(self, source):
+        _reduce_scatter(source, self.output, self.handle)
         return self.output
 
 

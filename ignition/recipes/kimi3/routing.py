@@ -31,6 +31,7 @@ MAX_ROWS = 32
 # Smallest per-rank segment a prefill gather moves on the copy-engine ring. Eight ring hops have
 # a fixed cost that kernel pushes do not; below this size the pushes are expected to finish first.
 RING_GATHER_MIN_BYTES = 512 << 10
+RING_COLUMN_GATHER_MIN_BYTES = 240 << 10
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
 
@@ -192,6 +193,85 @@ class PreparedLatentShardGather:
             _copy_rank_major_blocks(self.logits[begin:end].view(torch.bfloat16),
                                     received[:, :, self.down_columns:], 2 * self.router_columns)
         return self.latent
+
+
+class PreparedRingColumnGather:
+    """All-gather column shards [rows, local_cols] -> [rows, out_cols] on the copy-engine ring when >= 240 KiB."""
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name, ring=None):
+        from ignition.components.collectives import PreparedChunkedAllGather, PreparedRingGather
+
+        rows, self.local_cols = source.shape
+        self.output = output
+        self.world = 1 if runtime is None else runtime.world_size
+        self.ring = None
+        nbytes = rows * self.local_cols * source.element_size()
+        if (ring is not None and self.world > 1 and source.is_contiguous() and output.is_contiguous()
+                and nbytes % 16 == 0 and RING_COLUMN_GATHER_MIN_BYTES <= nbytes <= ring.gather_capacity):
+            self.ring = PreparedRingGather((rows, self.local_cols), source.dtype, runtime=ring,
+                session=session, coordinator=coordinator, name=name + '.ring')
+            return
+        self.fallback = PreparedChunkedAllGather(source, output, runtime=runtime,
+            session=session, coordinator=coordinator, name=name)
+
+    def __call__(self, source):
+        if self.ring is None:
+            return self.fallback(source)
+        slots = self.ring.slots
+        slots[self.world - 1].copy_(source)
+        self.ring()
+        _copy_slot_blocks(self.output, slots, self.local_cols, self.ring.first_rank)
+        self.ring.release()
+        return self.output
+
+
+class PreparedExpertReduceNorm:
+    """8-hop column-sharded expert reduce-scatter + lossless FP32 scalar norm exchange (skips 8 AG hops)."""
+
+    GROUP_ROWS = 32
+
+    def __init__(self, expert_output, weight, up_input, *, eps, dma_runtime, stats_runtime,
+                 session, coordinator, name, buffers, allocator=None):
+        from ignition.components.collectives import PreparedAllGather, PreparedReduceScatter
+
+        rows, self.full_width = expert_output.shape
+        _, self.local_width = up_input.shape
+        self.world = dma_runtime.world_size
+        self.eps, self.weight, self.up_input = float(eps), weight, up_input
+        if rows % self.GROUP_ROWS != 0 or (rows * self.local_width) % 128 != 0:
+            raise ValueError("PreparedExpertReduceNorm requires 32-row groups and 128-element aligned shards")
+
+        def allocate(key, shape, dtype):
+            cur = buffers.get(key)
+            if cur is None or cur.numel() < torch.Size(shape).numel():
+                buffers[key] = (torch.zeros(shape, dtype=dtype, device=expert_output.device)
+                                if allocator is None else allocator.zeros(shape, dtype))
+            return buffers[key].view(-1)[:torch.Size(shape).numel()].view(shape)
+
+        self.packed = allocate('expert_rs_packed', (self.world, rows, self.local_width), torch.bfloat16)
+        self.reduced_shard = allocate('expert_rs_shard', (rows, self.local_width), torch.bfloat16)
+        batches = rows // self.GROUP_ROWS
+        self.local_stats = allocate('expert_rs_local_stats', (batches, self.GROUP_ROWS), torch.float32)
+        self.gathered_stats_bf16 = allocate('expert_rs_gathered_stats',
+                                            (batches, self.world * self.GROUP_ROWS * 2), torch.bfloat16)
+        self.reduce_scatter = PreparedReduceScatter(self.packed, self.reduced_shard, runtime=dma_runtime,
+            session=session, coordinator=coordinator, name=name + '.expert_rs')
+        self.stats_gather = PreparedAllGather(
+            self.local_stats.view(torch.bfloat16).view(batches, self.GROUP_ROWS * 2),
+            self.gathered_stats_bf16, runtime=stats_runtime, session=session,
+            coordinator=coordinator, name=name + '.expert_norm_stats')
+
+    def __call__(self, expert_output):
+        from .pointwise import distributed_rms_norm, pack_expert_columns, partial_sum_sq
+
+        pack_expert_columns(expert_output, self.packed)
+        self.reduce_scatter(self.packed)
+        partial_sum_sq(self.reduced_shard, self.local_stats.view(-1))
+        batches = self.local_stats.shape[0]
+        self.stats_gather(self.local_stats.view(torch.bfloat16).view(batches, self.GROUP_ROWS * 2))
+        return distributed_rms_norm(self.reduced_shard, self.gathered_stats_bf16.view(torch.float32),
+            self.weight, self.up_input, full_width=self.full_width, world=self.world,
+            group_rows=self.GROUP_ROWS, eps=self.eps)
 
 
 def create_route_runtime(group, device, *, ipc=None):

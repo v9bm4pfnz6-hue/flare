@@ -91,3 +91,74 @@ def sigmoid_gate(value, gate):
     torch.library.wrap_triton(_sigmoid_gate)[(rows, triton.cdiv(width, block))](
         value, gate, value.stride(0), gate.stride(0), width, block, num_warps=4)
     return value
+
+
+@triton.jit
+def _pack_expert_columns(Source, Packed, source_stride, packed_rank_stride, packed_row_stride,
+                         WIDTH: tl.constexpr, LOCAL_WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    rank = tl.program_id(1).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    src_col = rank * LOCAL_WIDTH + cols
+    valid_in = (cols < LOCAL_WIDTH) & (src_col < WIDTH)
+    val = tl.load(Source + row * source_stride + src_col, mask=valid_in, other=0.0)
+    tl.store(Packed + rank * packed_rank_stride + row * packed_row_stride + cols, val, mask=cols < LOCAL_WIDTH)
+
+
+@triton.jit
+def _partial_sum_sq(Shard, Stats, shard_stride, LOCAL_WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    val = tl.load(Shard + row * shard_stride + cols, mask=cols < LOCAL_WIDTH, other=0.0).to(tl.float32)
+    sq = tl.sum(val * val, axis=0)
+    tl.store(Stats + row, sq)
+
+
+@triton.jit
+def _distributed_rms_norm(Shard, GatheredStats, Weight, Output, shard_stride, output_stride, eps,
+                          FULL_WIDTH: tl.constexpr, LOCAL_WIDTH: tl.constexpr, WORLD: tl.constexpr,
+                          GROUP_ROWS: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    batch = row // GROUP_ROWS
+    lane = row % GROUP_ROWS
+    # GatheredStats has layout [rows // GROUP_ROWS, WORLD, GROUP_ROWS] in float32.
+    total_sq = tl.zeros((), dtype=tl.float32)
+    for r in tl.static_range(0, WORLD):
+        total_sq += tl.load(GatheredStats + (batch * WORLD + r) * GROUP_ROWS + lane)
+    inv_rms = tl.rsqrt(total_sq / FULL_WIDTH + eps)
+    cols = tl.arange(0, BLOCK)
+    keep = cols < LOCAL_WIDTH
+    val = tl.load(Shard + row * shard_stride + cols, mask=keep, other=0.0).to(tl.float32)
+    normalized = (val * inv_rms).to(Output.dtype.element_ty)
+    weight = tl.load(Weight + cols, mask=keep, other=0.0).to(tl.float32)
+    tl.store(Output + row * output_stride + cols,
+             (weight * normalized.to(tl.float32)).to(Output.dtype.element_ty), mask=keep)
+
+
+def pack_expert_columns(source, packed):
+    rows, width = source.shape
+    world, p_rows, local_width = packed.shape
+    if p_rows != rows or source.stride(-1) != 1 or packed.stride(-1) != 1:
+        raise ValueError("pack_expert_columns requires contiguous [rows, width] and [world, rows, local_width]")
+    block = triton.next_power_of_2(local_width)
+    torch.library.wrap_triton(_pack_expert_columns)[(rows, world)](
+        source, packed, source.stride(0), packed.stride(0), packed.stride(1),
+        width, local_width, block, num_warps=4)
+    return packed
+
+
+def partial_sum_sq(shard, stats):
+    rows, local_width = shard.shape
+    block = triton.next_power_of_2(local_width)
+    torch.library.wrap_triton(_partial_sum_sq)[(rows,)](
+        shard, stats, shard.stride(0), local_width, block, num_warps=4)
+    return stats
+
+
+def distributed_rms_norm(shard, gathered_stats, weight, out, *, full_width, world, group_rows, eps):
+    rows, local_width = shard.shape
+    block = triton.next_power_of_2(local_width)
+    torch.library.wrap_triton(_distributed_rms_norm)[(rows,)](
+        shard, gathered_stats, weight, out, shard.stride(0), out.stride(0), float(eps),
+        full_width, local_width, world, group_rows, block, num_warps=4)
+    return out
