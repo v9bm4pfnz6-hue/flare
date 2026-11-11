@@ -452,7 +452,7 @@ class PreparedDecoder:
             runtime=embedding_runtime, coordinator=coordinator,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding", gather_cls=emb_gather_cls)
         self.delta = DeltaMetadata.allocate(metadata.starts.numel(), source.device,
-            verification_columns=8 if mode == "verify" else 1)
+            verification_columns=kda_records.corrections.shape[3] if mode == "verify" else 1)
         self.buffers, self.layers = buffers.scratch, []
         def zeros(shape):
             return (torch.zeros(shape, dtype=source.dtype, device=source.device) if allocator is None

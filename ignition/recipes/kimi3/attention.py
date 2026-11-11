@@ -211,7 +211,8 @@ class PreparedMLA:
             self.token_lengths.copy_(shards.local_tokens(m.positions + 1).to(torch.int32))
             self.attention()
             self.combine(self.partial, self.lse)
-        self.expanded.copy_(torch.bmm(self.attended.transpose(0, 1), self.weights["value"]).transpose(0, 1).flatten(1))
+        att_rows, att_heads = self.attended.shape[:2]
+        self.expanded.view(att_rows, att_heads, 128).copy_(torch.bmm(self.attended.transpose(0, 1), self.weights["value"]).transpose(0, 1))
         if self.gated:
             sigmoid_gate(self.expanded, self.gate)
         return p["output"](self.expanded)

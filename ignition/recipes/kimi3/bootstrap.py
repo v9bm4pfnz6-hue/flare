@@ -135,9 +135,9 @@ class PreparationConfig:
 
     def __post_init__(self):
         if self.prefill_reduction not in ("fp32-owner-packet", "bf16-gather", "bf16-first-hop",
-                                          "bf16-direct", "fp24-ring", "tree-2+2+2+2+1"):
+                                          "bf16-direct", "fp24-ring", "mxfp16-ring", "tree-2+2+2+2+1"):
             raise ValueError(
-                "prefill reduction must be fp32-owner-packet, bf16-gather, bf16-first-hop, bf16-direct, fp24-ring or tree-2+2+2+2+1"
+                "prefill reduction must be fp32-owner-packet, bf16-gather, bf16-first-hop, bf16-direct, fp24-ring, mxfp16-ring or tree-2+2+2+2+1"
             )
         if self.prefill_gather not in ("kernel", "ring"):
             raise ValueError("prefill gather must be kernel or ring")
@@ -311,6 +311,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             bf16_first_hop=config.prefill_reduction == "bf16-first-hop",
             bf16_direct=config.prefill_reduction == "bf16-direct",
             fp24_ring=config.prefill_reduction == "fp24-ring",
+            mxfp16_ring=config.prefill_reduction == "mxfp16-ring",
             tree=(config.prefill_reduction.removeprefix("tree-")
                   if config.prefill_reduction.startswith("tree-") else None)) if dma_prefill else
             create_single_round_all_reduce_runtime(group, device,
@@ -349,7 +350,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         norm_stats_collective = (create_all_gather_runtime(group, device,
             max_rows=max(1, -(-config.prefill_chunk_size // 32)), columns=64 * shard.world_size,
             ipc=package_storage.peer_storage)
-            if dma_prefill and config.prefill_reduction in ("bf16-direct", "fp24-ring") and shard.world_size > 1
+            if dma_prefill and config.prefill_reduction in ("bf16-direct", "fp24-ring", "mxfp16-ring") and shard.world_size > 1
             else None)
         vision_collectives = {}
         if config.vision and weights.vision.shard.world_size > 1:

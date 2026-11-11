@@ -50,6 +50,21 @@ def _filter_sort_selected(Source, Physical, Counts, Positions, slot_stride, begi
 
 
 @triton.jit
+def _layer_norm_128_bf16(Input, Weight, Bias, Output, in_stride, out_stride, eps):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, 128)
+    x = tl.load(Input + row * in_stride + cols).to(tl.float32)
+    mean = tl.sum(x, axis=0) / 128.0
+    diff = x - mean
+    var = tl.sum(diff * diff, axis=0) / 128.0
+    inv = tl.rsqrt(var + eps)
+    w = tl.load(Weight + cols).to(tl.float32)
+    b = tl.load(Bias + cols).to(tl.float32)
+    out = diff * inv * w + b
+    tl.store(Output + row * out_stride + cols, out.to(Output.dtype.element_ty))
+
+
+@triton.jit
 def _quantize_prefill_queries(Query, Quantized, begin, count, q_row_stride, out_row_stride,
                               TOTAL_COLS: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
@@ -193,8 +208,9 @@ class PreparedGatheredDSA:
             self.folded_weights.copy_(self.head_weights[:, columns])
             glm_pool.quantize_queries(*self.query_arguments, plan=self.query_plan)
             self.exchange(self.local_quantized.view(self.rows,-1), self.folded_weights)
-        self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (128,),
-            self.norm_weight.float(), self.norm_bias.float(), self.eps).to(torch.bfloat16))
+        _launch(_layer_norm_128_bf16, (self.rows,),
+                (self.key_input, self.norm_weight, self.norm_bias, self.key,
+                 self.key_input.stride(0), self.key.stride(0), float(self.eps)), num_warps=4)
         torch.library.wrap_triton(_write_keys)[(self.rows,)](self.key,
             self.index_cache.view(torch.float8_e4m3fn), self.index_cache.view(torch.float32),
             self.slots, self.index_cache.stride(0), False, num_warps=4)
