@@ -118,7 +118,8 @@ def create_result_broadcast_runtime(group, device, *, layouts, ipc=None):
 
 
 def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
-                                 wire_mode=None, bf16_gather=False, tree=None, bf16_first_hop=False):
+                                 wire_mode=None, bf16_gather=False, tree=None, bf16_first_hop=False,
+                                 bf16_direct=False, fp24_ring=False):
     """Allocate a b12x copy-engine ring for prefill reductions in caller-owned shared storage.
 
     bf16_gather keeps the ring's ordered FP32 reduce-scatter and forwards a single
@@ -145,9 +146,15 @@ def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc
         raise ValueError("a tree reduction names its topology and takes BF16 activations without the ring's gather")
     if type(bf16_first_hop) is not bool or bf16_first_hop and not bf16_gather:
         raise ValueError("a BF16 first hop belongs to the BF16 gather ring")
+    if type(bf16_direct) is not bool or type(fp24_ring) is not bool or (bf16_direct and fp24_ring):
+        raise ValueError("bf16_direct and fp24_ring are mutually exclusive booleans")
+    if (bf16_direct or fp24_ring) and (bf16_gather or tree is not None or element_bytes != 2):
+        raise ValueError("direct BF16/FP24 rings take two-byte activations without tree or FP32-packet gather")
     return DmaAllReduce(exchange_group=group, device=device, max_bytes=max_tokens * hidden_size * element_bytes,
                         ipc=ipc, fp8=wire_mode, bf16_gather=bf16_gather, **({} if tree is None else {"tree": tree}),
-                        **({"bf16_first_hop": True} if bf16_first_hop else {}))
+                        **({"bf16_first_hop": True} if bf16_first_hop else {}),
+                        **({"bf16_direct": True} if bf16_direct else {}),
+                        **({"fp24_ring": True} if fp24_ring else {}))
 
 
 def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head_dim=None, ipc=None):

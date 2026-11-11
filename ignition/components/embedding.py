@@ -39,11 +39,13 @@ class PreparedEmbedding:
 class PreparedShardedEmbedding:
     """Gather column-sharded vocabulary rows through a prepared collective."""
 
-    def __init__(self, weight, ids, local_output, output, *, runtime, coordinator, session, name, num_rows=None):
+    def __init__(self, weight, ids, local_output, output, *, runtime, coordinator, session, name, num_rows=None,
+                 gather_cls=None):
         self.lookup = PreparedEmbedding(weight, ids, local_output, session=session, name=name + ".lookup",
                                         num_rows=num_rows)
-        self.gather = PreparedChunkedAllGather(local_output, output, runtime=runtime, coordinator=coordinator,
-                                               session=session, name=name + ".gather")
+        cls = PreparedChunkedAllGather if gather_cls is None else gather_cls
+        self.gather = cls(local_output, output, runtime=runtime, coordinator=coordinator,
+                          session=session, name=name + ".gather")
 
     def __call__(self):
         return self.gather(self.lookup())

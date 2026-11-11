@@ -10,7 +10,7 @@ import torch
 import triton
 
 from ignition.components.collectives import PreparedChunkedAllGather, PreparedChunkedAllReduce
-from ignition.components.owner_packet_reduce import aligned_extent, copy_engine_reduction
+from ignition.components.owner_packet_reduce import aligned_extent, copy_engine_reduction, direct_aligned_extent
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
@@ -24,7 +24,13 @@ from .kda import PreparedKDA
 from .pointwise import rms_norm_columns, situ
 from .projections import prepare_projection
 from .residual import ADD, REPLACE, ResidualStream
-from .routing import MAX_ROWS as ROUTE_ROWS, PreparedLatentShardGather, PreparedRouteGather
+from .routing import (
+    MAX_ROWS as ROUTE_ROWS,
+    PreparedExpertReduceNorm,
+    PreparedLatentShardGather,
+    PreparedRingColumnGather,
+    PreparedRouteGather,
+)
 
 
 # A concurrent shared-expert MLP forks onto the auxiliary stream after its input is written and joins before its
@@ -65,6 +71,51 @@ def _join_shared_expert(source: torch.Tensor, routed: torch.Tensor, outputs: lis
 
 @_join_shared_expert.register_fake
 def _fake_join_shared_expert(source, routed, outputs, workspace, auxiliary_stream) -> None:
+    pass
+
+
+@torch.library.custom_op("flare::kimi3_start_shared_expert_stage1", mutates_args=("outputs", "workspace"))
+def _start_shared_expert_stage1(source: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor | None,
+                                outputs: list[torch.Tensor], workspace: torch.Tensor, plan: int,
+                                auxiliary_stream: int) -> None:
+    from ignition.components.sm103_projection import bf16_out, packed_out_workspace
+
+    main = torch.cuda.current_stream(source.device)
+    auxiliary = torch.cuda.ExternalStream(auxiliary_stream, device=source.device)
+    auxiliary.wait_stream(main)
+    gate_up, intermediate, _ = outputs
+    with torch.cuda.stream(auxiliary):
+        if scale is None:
+            bf16_out(source, weight, gate_up, plan)
+        else:
+            packed_out_workspace(source, weight, scale, None, None, gate_up, workspace, "none", None, plan, "any")
+        situ(gate_up, intermediate)
+
+
+@_start_shared_expert_stage1.register_fake
+def _fake_start_shared_expert_stage1(source, weight, scale, outputs, workspace, plan, auxiliary_stream) -> None:
+    pass
+
+
+@torch.library.custom_op("flare::kimi3_start_shared_expert_stage2", mutates_args=("outputs", "workspace"))
+def _start_shared_expert_stage2(dependency: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor | None,
+                                outputs: list[torch.Tensor], workspace: torch.Tensor, plan: int,
+                                auxiliary_stream: int) -> None:
+    from ignition.components.sm103_projection import bf16_out, packed_out_workspace
+
+    main = torch.cuda.current_stream(dependency.device)
+    auxiliary = torch.cuda.ExternalStream(auxiliary_stream, device=dependency.device)
+    auxiliary.wait_stream(main)
+    _, intermediate, projected = outputs
+    with torch.cuda.stream(auxiliary):
+        if scale is None:
+            bf16_out(intermediate, weight, projected, plan)
+        else:
+            packed_out_workspace(intermediate, weight, scale, None, None, projected, workspace, "none", None, plan, "any")
+
+
+@_start_shared_expert_stage2.register_fake
+def _fake_start_shared_expert_stage2(dependency, weight, scale, outputs, workspace, plan, auxiliary_stream) -> None:
     pass
 
 
@@ -180,6 +231,17 @@ class PreparedMLP:
         _start_shared_expert(source, self.weights, self.scales, self.outputs, self.workspace,
                              [self.gate_up.plan.handle, self.down.plan.handle], self.stream_handle)
 
+    def start_stage1(self, source):
+        _start_shared_expert_stage1(source, self.weights[0], self.scales[0], self.outputs, self.workspace,
+                                    self.gate_up.plan.handle, self.stream_handle)
+
+    def join_stage1(self, source, routed):
+        _join_shared_expert(source, routed, self.outputs, self.workspace, self.stream_handle)
+
+    def start_stage2(self, dependency):
+        _start_shared_expert_stage2(dependency, self.weights[1], self.scales[1], self.outputs, self.workspace,
+                                    self.down.plan.handle, self.stream_handle)
+
     def finish(self, source, routed):
         _join_shared_expert(source, routed, self.outputs, self.workspace, self.stream_handle)
         return self.down.output
@@ -188,7 +250,8 @@ class PreparedMLP:
 class PreparedLatentMoE:
     def __init__(self, weights, source, config, shard, *, runtime, router_runtime, coordinator, session, name, workspace, buffers, storage,
                  route_runtime=None, prefill_route_runtime=None, allocator=None, accumulation_buffers=None,
-                 reduction_staging=None, route_gather_runtime=None, copy_engine=False, gather_ring=None):
+                 reduction_staging=None, route_gather_runtime=None, copy_engine=False, gather_ring=None,
+                 stats_runtime=None):
         tokens, hidden = source.shape
         c, device = config.text, source.device
         latent = c["routed_expert_hidden_size"]
@@ -217,8 +280,16 @@ class PreparedLatentMoE:
         self.latent_norm, self.eps = weights["latent_norm"], c["rms_norm_eps"]
         reduction = copy_engine_reduction if copy_engine else PreparedChunkedAllReduce
         reduction_args = (dict(workspace=accumulation_buffers, staging=reduction_staging) if copy_engine else {})
-        self.expert_reduce = reduction(self.expert_output, self.latent_sum, runtime=runtime,
-            coordinator=coordinator, session=session, name=name + ".expert_reduce", **reduction_args)
+        self.expert_reduce_norm = None
+        if (copy_engine and getattr(runtime, 'direct_mode', '') and stats_runtime is not None
+                and tokens >= 512 and tokens % 32 == 0 and (tokens * local_latent) % 128 == 0):
+            self.expert_reduce_norm = PreparedExpertReduceNorm(self.expert_output, self.latent_norm, self.up_input,
+                eps=self.eps, dma_runtime=runtime, stats_runtime=stats_runtime, session=session,
+                coordinator=coordinator, name=name, buffers=buffers, allocator=allocator)
+            self.expert_reduce = None
+        else:
+            self.expert_reduce = reduction(self.expert_output, self.latent_sum, runtime=runtime,
+                coordinator=coordinator, session=session, name=name + ".expert_reduce", **reduction_args)
         local_logits = buffer("local_router", weights["router"].shape[0], torch.float32)
         self.router_projection = UnquantizedProjection(source, weights["router"], local_logits, session=session, name=name + ".router")
         if "routes" not in buffers:
@@ -277,7 +348,8 @@ class PreparedLatentMoE:
                                   if self.route_gather is not None or self.prefill_route_gather is not None else ())
 
     def __call__(self, source):
-        if self.shared.concurrent:
+        two_stage = self.shared.concurrent and self.prefill_route_gather is not None
+        if self.shared.concurrent and not two_stage:
             self.shared.start(source)
         logits = self.router_projection(source)
         if self.route_gather is not None:
@@ -285,8 +357,14 @@ class PreparedLatentMoE:
             self.route_gather()
         elif self.prefill_route_gather is not None:
             self.down(source)
+            if two_stage:
+                # Stage 1 (gate_up + SiTU) runs on the low-priority overlap stream concurrently with
+                # the copy-engine route gather and joins before the cooperative routed-expert kernel.
+                self.shared.start_stage1(source)
             self.prefill_route_gather()
             self.router(self.router_logits)
+            if two_stage:
+                self.shared.join_stage1(source, self.latent)
         else:
             self.router_input[:, :logits.shape[1]].copy_(logits)
             self.router_gather(self.router_input.view(torch.bfloat16))
@@ -300,8 +378,15 @@ class PreparedLatentMoE:
             self.router(self.router_logits)
             self.source.copy_(source.index_select(1, self.hidden_columns))
             self.down_reduce(self.down(self.source))
-        self.expert_reduce(self.experts())
-        rms_norm_columns(self.latent_sum, self.latent_norm, self.up_input, self.eps, begin=self.latent_begin)
+        routed = self.experts()
+        if two_stage:
+            # Stage 2 (shared down projection) runs concurrently with the copy-engine expert reduction.
+            self.shared.start_stage2(routed)
+        if getattr(self, 'expert_reduce_norm', None) is not None:
+            self.expert_reduce_norm(routed)
+        else:
+            self.expert_reduce(routed)
+            rms_norm_columns(self.latent_sum, self.latent_norm, self.up_input, self.eps, begin=self.latent_begin)
         self.up(self.up_input)
         shared = self.shared.finish(source, self.output) if self.shared.concurrent else self.shared(source)
         self.output.add_(shared)
@@ -318,7 +403,7 @@ class PreparedDecoder:
 
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, vocabulary_runtime, embedding_runtime, router_runtime, vision_state,
                  coordinator, session, name, workspace, buffers, kda_records=None, route_runtime=None, context=None,
-                 latent_runtimes=(), scoring=None, prefill_route_runtime=None, ring_gather=False):
+                 latent_runtimes=(), scoring=None, prefill_route_runtime=None, ring_gather=False, stats_runtime=None):
         # Verification records its candidate rows; other modes ignore records.
         if mode not in ("prefill", "decode", "verify") or mode == "verify" and kda_records is None:
             raise ValueError("Kimi K3 verification decodes recorded candidate rows")
@@ -337,9 +422,11 @@ class PreparedDecoder:
             # Size the FP32 packet workspace to the ring-aligned extent, not the raw payload:
             # an unaligned prefill shape otherwise reduces its 64-element alignment tail as a
             # second, fully synchronized ring invocation.
-            ring_elements = aligned_extent(source.numel(), runtime.world_size) * runtime.world_size
-            if runtime.tree is None:
-                # A tree channel sums the BF16 activations themselves and needs no FP32 packets.
+            direct_ring = bool(getattr(runtime, 'direct_mode', ''))
+            extent_fn = direct_aligned_extent if direct_ring else aligned_extent
+            ring_elements = extent_fn(source.numel(), runtime.world_size) * runtime.world_size
+            if runtime.tree is None and not direct_ring:
+                # Tree and direct BF16/FP24 channels reduce BF16 activations without FP32 packet copies.
                 count = min(ring_elements, runtime.max_bytes // 4)
                 key = "prefill_reduction_workspace"
                 if key not in buffers.scratch or buffers.scratch[key].numel() < count:
@@ -352,15 +439,18 @@ class PreparedDecoder:
                     buffers.scratch[key] = (torch.zeros(ring_elements, dtype=source.dtype, device=source.device)
                         if allocator is None else allocator.zeros((ring_elements,), source.dtype))
                 reduction_staging = buffers.scratch[key]
+        active_gather_ring = runtime if copy_engine and ring_gather else None
         if ("local_embedding" not in buffers.scratch
                 or buffers.scratch["local_embedding"].shape[0] < source.shape[0]):
             shape = (source.shape[0], weights.embedding.shape[1])
             buffers.scratch["local_embedding"] = (torch.zeros(shape, dtype=source.dtype, device=source.device)
                 if allocator is None else allocator.zeros(shape, source.dtype))
         self.local_embedding = buffers.scratch["local_embedding"][:source.shape[0]]
+        emb_gather_cls = None if active_gather_ring is None else (
+            lambda src, out, **kw: PreparedRingColumnGather(src, out, ring=active_gather_ring, **kw))
         self.embedding = PreparedShardedEmbedding(weights.embedding, metadata.token_ids, self.local_embedding, source,
             runtime=embedding_runtime, coordinator=coordinator,
-            num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
+            num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding", gather_cls=emb_gather_cls)
         self.delta = DeltaMetadata.allocate(metadata.starts.numel(), source.device,
             verification_columns=8 if mode == "verify" else 1)
         self.buffers, self.layers = buffers.scratch, []
@@ -419,6 +509,7 @@ class PreparedDecoder:
                             # The smallest latent exchange that carries the step, else the largest in chunks.
                             latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
                                          latent_runtimes[-1] if latent_runtimes else None),
+                            gather_ring=active_gather_ring,
                             **kwargs))
             if "mlp" in w:
                 # The dense MLP writes the MoE layers' output, which its reduction consumes before the next mixture.
@@ -442,7 +533,8 @@ class PreparedDecoder:
                     accumulation_buffers=accumulation_buffers, reduction_staging=reduction_staging,
                     copy_engine=copy_engine,
                     # Large prefill gathers may ride the ring that reduces this graph.
-                    gather_ring=runtime if copy_engine and ring_gather else None)
+                    gather_ring=active_gather_ring,
+                    stats_runtime=stats_runtime if mode == 'prefill' else None)
             # The sum buffer is consumed before the next attention or MLP reduction.
             total = self.buffers["total"][:source.shape[0]]
             reduction = copy_engine_reduction if copy_engine else PreparedChunkedAllReduce
