@@ -32,8 +32,8 @@ SPLIT_STRIDE = 2 * SPLIT_CHUNKS * SPLIT_SOURCES + SPLIT_CHUNKS
 def _mix(Prefix, Delta, Blocks, Score, Norm, Output, Mixture, MixtureCount, prefix_stride, delta_stride, block_row_stride,
          block_stride, output_stride, mixture_stride, eps, output_eps, HIDDEN: tl.constexpr, SOURCES: tl.constexpr,
          WRITE: tl.constexpr, DELTA: tl.constexpr, MIXTURE: tl.constexpr, COMPACT_MIXTURE: tl.constexpr,
-         ROWS: tl.constexpr, MIXTURE_ROWS: tl.constexpr, MIXTURE_WINDOW: tl.constexpr, MIXTURE_ALIGNMENT: tl.constexpr,
-         BLOCK: tl.constexpr, TILE: tl.constexpr):
+         ROWS: tl.constexpr, SUB_ROWS: tl.constexpr, ROW_OFFSET: tl.constexpr, MIXTURE_ROWS: tl.constexpr,
+         MIXTURE_WINDOW: tl.constexpr, MIXTURE_ALIGNMENT: tl.constexpr, BLOCK: tl.constexpr, TILE: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     columns = tl.arange(0, BLOCK)
     valid = columns < HIDDEN
@@ -75,12 +75,17 @@ def _mix(Prefix, Delta, Blocks, Score, Norm, Output, Mixture, MixtureCount, pref
         if COMPACT_MIXTURE:
             count = tl.load(MixtureCount).to(tl.int64)
             origin = tl.maximum(count - MIXTURE_WINDOW, 0) // MIXTURE_ALIGNMENT * MIXTURE_ALIGNMENT
-            destination = row - origin
+            global_row = ROW_OFFSET + row
+            destination = global_row - origin
             retained = (destination >= 0) & (destination < MIXTURE_ROWS)
-            values = tl.where(row < count, mixed, 0).to(Mixture.dtype.element_ty)
+            values = tl.where(global_row < count, mixed, 0).to(Mixture.dtype.element_ty)
             tl.store(Mixture + destination * mixture_stride + columns, values, valid & retained)
-            padding = (row < MIXTURE_ROWS) & (origin + row >= ROWS)
-            tl.store(Mixture + row * mixture_stride + columns, 0., valid & padding)
+            if ROW_OFFSET == 0:
+                pad_r = row
+                while pad_r < MIXTURE_ROWS:
+                    padding = origin + pad_r >= ROWS
+                    tl.store(Mixture + pad_r * mixture_stride + columns, 0., valid & padding)
+                    pad_r += SUB_ROWS
         else:
             tl.store(Mixture + row * mixture_stride + columns, mixed.to(Mixture.dtype.element_ty), valid)
     normalized = (mixed * tl.rsqrt(tl.sum(mixed * mixed) / HIDDEN + output_eps)).to(Prefix.dtype.element_ty)
@@ -191,13 +196,15 @@ def score_weight(norm_weight, projection):
 class ResidualStream:
     """Running block sum, committed residual blocks, and the normalized input of the next projection."""
 
-    def __init__(self, prefix, blocks, output, *, split_rows=SPLIT_ROWS):
+    def __init__(self, prefix, blocks, output, *, split_rows=SPLIT_ROWS, row_offset=0, full_rows=None):
         tokens, hidden = prefix.shape
         if (blocks.shape[0], blocks.shape[2]) != (tokens, hidden) or output.shape != prefix.shape:
             raise ValueError("residual blocks and output must match the running sum's rows and width")
         if any(t.stride(-1) != 1 or t.dtype != torch.bfloat16 for t in (prefix, blocks, output)):
             raise ValueError("residual stream tensors must be BF16 with contiguous rows")
         self.prefix, self.blocks, self.output = prefix, blocks, output
+        self.row_offset = int(row_offset)
+        self.full_rows = int(tokens if full_rows is None else full_rows)
         self.split = None
         if 0 < tokens <= split_rows:
             chunk, warps = SPLIT_CHUNK, SPLIT_WARPS
@@ -207,6 +214,12 @@ class ResidualStream:
             # Tagged partial-sum slots and a per-row call epoch; allocated once, never reset.
             self.split = (torch.zeros((tokens, SPLIT_STRIDE), dtype=torch.int64, device=prefix.device),
                           torch.zeros((tokens,), dtype=torch.int32, device=prefix.device), chunk, warps)
+
+    def substream(self, begin: int, end: int, *, output=None):
+        """Zero-copy row slice [begin:end] sharing the full residual stream's global row indexing."""
+        out = self.output[begin:end] if output is None else output
+        return ResidualStream(self.prefix[begin:end], self.blocks[begin:end], out,
+                              split_rows=0, row_offset=self.row_offset + begin, full_rows=self.full_rows)
 
     def mix(self, delta, mode, *, sources, write, score, norm, eps, output_eps, mixture=None,
             mixture_count=None, mixture_window=None, mixture_alignment=1, output=None):
@@ -231,7 +244,7 @@ class ResidualStream:
         if mixture is not None:
             if (mixture.ndim != 2 or mixture.shape[1] != self.prefix.shape[1] or mixture.stride(-1) != 1
                     or mixture.device != self.prefix.device
-                    or not 0 < mixture.shape[0] <= self.prefix.shape[0]
+                    or not 0 < mixture.shape[0] <= self.full_rows
                     or mixture_count is None and mixture.shape != self.prefix.shape):
                 raise ValueError("residual mixture output must match the width and declared retained row capacity")
         output = self.output if output is None else output
@@ -240,6 +253,9 @@ class ResidualStream:
         rows, hidden = self.prefix.shape
         delta = self.prefix if delta is None else delta
         tile, warps = TILES[min(sources, len(TILES) - 1)]
+        if rows >= 128 and sources >= 4:
+            # Avoid 255-register saturation and 140-byte local-memory spills at TILE=8 on large prefill rows.
+            tile, warps = 2, 16
         if self.split is not None and sources < SPLIT_SOURCES:
             partial, epoch, chunk, split_warps = self.split
             torch.library.wrap_triton(_mix_split)[(rows, triton.cdiv(hidden, chunk))](
@@ -258,7 +274,7 @@ class ResidualStream:
             self.prefix.stride(0), delta.stride(0), self.blocks.stride(0), self.blocks.stride(1),
             output.stride(0), (output if mixture is None else mixture).stride(0), float(eps),
             float(output_eps), hidden, sources, write, mode, mixture is not None, mixture_count is not None,
-            rows, 0 if mixture is None else mixture.shape[0], mixture_window or 0, mixture_alignment,
-            triton.next_power_of_2(hidden),
+            self.full_rows, rows, self.row_offset, 0 if mixture is None else mixture.shape[0],
+            mixture_window or 0, mixture_alignment, triton.next_power_of_2(hidden),
             tile, num_warps=warps)
         return output

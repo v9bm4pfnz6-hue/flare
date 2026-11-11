@@ -98,6 +98,39 @@ def _copy_rank_major_blocks(destination, received, block):
             destination[:, begin:begin + count].copy_(received[:, full, :count])
 
 
+@triton.jit
+def _pack_shard_gather_slot(DownI16, RouterI16, OwnSlotI16, down_stride, router_stride, slot_stride,
+                            DOWN_COLS: tl.constexpr, TOTAL_COLS: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    in_down = cols < DOWN_COLS
+    in_router = (cols >= DOWN_COLS) & (cols < TOTAL_COLS)
+    d_val = tl.load(DownI16 + row * down_stride + cols, mask=in_down, other=0)
+    r_val = tl.load(RouterI16 + row * router_stride + (cols - DOWN_COLS), mask=in_router, other=0)
+    val = tl.where(in_down, d_val, r_val)
+    tl.store(OwnSlotI16 + row * slot_stride + cols, val, mask=cols < TOTAL_COLS)
+
+
+@triton.jit
+def _unpack_shard_gather_slots(SlotsI16, LatentI16, LogitsI16, slot_rank_stride, slot_row_stride, lat_stride, log_stride,
+                               FIRST_RANK: tl.constexpr, WORLD: tl.constexpr, DOWN_COLS: tl.constexpr,
+                               LATENT_WIDTH: tl.constexpr, ROUTER_I16_COLS: tl.constexpr,
+                               LOGITS_I16_WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.program_id(1).to(tl.int64)
+    rank = (FIRST_RANK + slot) % WORLD
+    cols = tl.arange(0, BLOCK)
+    base = SlotsI16 + slot * slot_rank_stride + row * slot_row_stride
+    d_dst = rank * DOWN_COLS + cols
+    d_valid = (cols < DOWN_COLS) & (d_dst < LATENT_WIDTH)
+    d_val = tl.load(base + cols, mask=d_valid, other=0)
+    tl.store(LatentI16 + row * lat_stride + d_dst, d_val, mask=d_valid)
+    r_dst = rank * ROUTER_I16_COLS + cols
+    r_valid = (cols < ROUTER_I16_COLS) & (r_dst < LOGITS_I16_WIDTH)
+    r_val = tl.load(base + DOWN_COLS + cols, mask=r_valid, other=0)
+    tl.store(LogitsI16 + row * log_stride + r_dst, r_val, mask=r_valid)
+
+
 def _copy_slot_blocks(destination, slots, block, first_rank):
     """Copy rank blocks of a ring gather into rows.
 
@@ -170,18 +203,39 @@ class PreparedLatentShardGather:
             runtime=runtime, session=session, coordinator=coordinator, name=f"{name}.{index}")
             for index, (begin, end) in enumerate(self.bounds)]
 
+    def pack_ring(self):
+        own_i16 = self.ring.slots[self.world - 1].view(torch.int16)
+        down_i16 = self.local_down.view(torch.int16)
+        router_i16 = self.local_router.view(torch.int16)
+        rows = down_i16.shape[0]
+        r_cols = 2 * self.router_columns
+        total = self.down_columns + r_cols
+        block = triton.next_power_of_2(total)
+        torch.library.wrap_triton(_pack_shard_gather_slot)[(rows,)](
+            down_i16, router_i16, own_i16,
+            down_i16.stride(0), router_i16.stride(0), own_i16.stride(0),
+            self.down_columns, total, block, num_warps=4)
+
+    def ring_and_unpack(self):
+        slots_i16 = self.ring.slots.view(torch.int16)
+        self.ring()
+        lat_i16 = self.latent.view(torch.int16)
+        log_i16 = self.logits.view(torch.int16)
+        rows = lat_i16.shape[0]
+        r_cols = 2 * self.router_columns
+        block = triton.next_power_of_2(max(self.down_columns, r_cols))
+        torch.library.wrap_triton(_unpack_shard_gather_slots)[(rows, self.world)](
+            slots_i16, lat_i16, log_i16,
+            slots_i16.stride(0), slots_i16.stride(1), lat_i16.stride(0), log_i16.stride(0),
+            self.ring.first_rank, self.world, self.down_columns, lat_i16.shape[1],
+            r_cols, log_i16.shape[1], block, num_warps=4)
+        self.ring.release()
+        return self.latent
+
     def __call__(self):
         if self.ring is not None:
-            slots = self.ring.slots
-            own = slots[self.world - 1]
-            own[:, :self.down_columns].copy_(self.local_down)
-            own[:, self.down_columns:].copy_(self.local_router.view(torch.bfloat16))
-            self.ring()
-            first = self.ring.first_rank
-            _copy_slot_blocks(self.latent, slots, self.down_columns, first)
-            _copy_slot_blocks(self.logits.view(torch.bfloat16), slots[:, :, self.down_columns:],
-                              2 * self.router_columns, first)
-            self.ring.release()
+            self.pack_ring()
+            self.ring_and_unpack()
             return self.latent
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
             count = end - begin
