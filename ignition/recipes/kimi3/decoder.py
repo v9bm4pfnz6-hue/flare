@@ -521,11 +521,11 @@ class PreparedDecoder:
             and active_gather_ring is not None and stats_runtime is not None
             and workspace is not None and workspace.overlap
             and tokens >= 2048 and tokens % 512 == 0
+            and metadata.lengths.numel() == 1
             and (not self.auxiliary_layers or config.draft.auxiliary_source == 'attention_input')
         )
         if self.dual_wave:
             self.half_tokens = tokens // 2
-            # Pad half-reductions to a multiple of 9 rows ((pad_r * 7168) % (9 * 256) == 0) for zero staging copies.
             pad_cand = -(-self.half_tokens // runtime.world_size) * runtime.world_size
             self.half_pad_rows = pad_cand if pad_cand * hidden * 2 <= runtime.max_bytes else self.half_tokens
             for key_dw, r_cap in (('dual_mlp_in', tokens), ('dual_total_w0', self.half_pad_rows), ('dual_total_w1', self.half_pad_rows)):
@@ -534,6 +534,10 @@ class PreparedDecoder:
             self.dual_mlp_in = self.buffers['dual_mlp_in'][:tokens]
             self.dual_total_w0 = self.buffers['dual_total_w0'][:self.half_pad_rows]
             self.dual_total_w1 = self.buffers['dual_total_w1'][:self.half_pad_rows]
+            self.delta_a = DeltaMetadata.allocate(1, source.device)
+            self.delta_b = DeltaMetadata.allocate(1, source.device)
+            self.comm_priority_stream = torch.cuda.Stream(device=source.device, priority=-1)
+            self.comm_stream_handle = self.comm_priority_stream.cuda_stream
             self.comp_stream_handle = workspace.auxiliary_stream.cuda_stream
             self.dual_layers = []
         for index, w in enumerate(weights.layers):
@@ -549,9 +553,23 @@ class PreparedDecoder:
                 tot_w0 = self.dual_total_w0
                 tot_w1 = self.dual_total_w1
                 reduction_args = dict(workspace=accumulation_buffers, staging=reduction_staging)
-                attention = (PreparedKDA(w['attention'], attn_in, pool.recurrent(index), self.delta,
-                    eps=config.text['rms_norm_eps'], dual_wave=True, out_pad_rows=pad_r, **kwargs) if kind == 'kda' else
-                    PreparedMLA(w['attention'], attn_in, metadata, pool.attention(index), context=context,
+                if kind == 'kda':
+                    kda_dw = self.buffers.setdefault('kda_dw', {})
+                    for wk in ('w0', 'w1'):
+                        kb = kda_dw.setdefault(wk, {})
+                        if 'output' not in kb or kb['output'].shape[0] < pad_r:
+                            kb['output'] = buffers.stage_allocator('kda').zeros((pad_r, hidden), torch.bfloat16)
+                    kda_a = PreparedKDA(w['attention'], attn_in[:half], pool.recurrent(index), self.delta_a,
+                        eps=config.text['rms_norm_eps'], mode=mode, session=session, name=prefix + '.attention.w0',
+                        workspace=workspace, buffers=kda_dw['w0'], allocator=buffers.stage_allocator('kda'))
+                    kda_b = PreparedKDA(w['attention'], attn_in[half:], pool.recurrent(index), self.delta_b,
+                        eps=config.text['rms_norm_eps'], mode=mode, session=session, name=prefix + '.attention.w1',
+                        workspace=workspace, buffers=kda_dw['w1'], allocator=buffers.stage_allocator('kda'))
+                    out_p0 = kda_dw['w0']['output'][:pad_r]
+                    out_p1 = kda_dw['w1']['output'][:pad_r]
+                    attention = (kda_a, kda_b, out_p0, out_p1)
+                else:
+                    attention = PreparedMLA(w['attention'], attn_in, metadata, pool.attention(index), context=context,
                                 index_cache=pool.index(index) if kind == 'dsa' else None,
                                 eps=config.text['rms_norm_eps'],
                                 peers=context.peers.get(index) if context is not None else None,
@@ -560,8 +578,8 @@ class PreparedDecoder:
                                 selection=self.selection, coordinator=coordinator,
                                 latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
                                              latent_runtimes[-1] if latent_runtimes else None),
-                                gather_ring=active_gather_ring, dual_wave=True, out_pad_rows=pad_r, **kwargs))
-                out_p0, out_p1 = attention.out_pads
+                                gather_ring=active_gather_ring, dual_wave=True, out_pad_rows=pad_r, **kwargs)
+                    out_p0, out_p1 = attention.out_pads
                 attn_red_a = copy_engine_reduction(out_p0, tot_w0, runtime=runtime,
                     coordinator=coordinator, session=session, name=prefix + '.attn_reduce.w0', **reduction_args)
                 attn_red_b = copy_engine_reduction(out_p1, tot_w1, runtime=runtime,
@@ -743,7 +761,30 @@ class PreparedDecoder:
     def _call_dual_wave(self, delta, mode, size, eps):
         """Interleave half-chunk (Wave A [0:H], Wave B [H:2H]) SM compute on comp_stream with PCIe DMA rings on main."""
         half = self.half_tokens
+        m = self.metadata
+        la = m.lengths.clamp(min=0, max=half).to(torch.int32)
+        lb = (m.lengths - half).clamp(min=0, max=half).to(torch.int32)
+        act_a = la > 0
+        act_b = lb > 0
+        da, db = self.delta_a, self.delta_b
+        da.query_start_loc[0].zero_(); da.query_start_loc[1:].copy_(la)
+        da.convolution_slots.copy_(torch.where(act_a, m.state_rows, -1))
+        torch.eq(m.starts, 0, out=da.fresh)
+        da.state_indices[:, 0].copy_(m.state_rows)
+        da.initial_state_indices.copy_(torch.where(m.starts > 0, m.state_rows, 0))
+        da.final_state_indices.copy_(torch.where(act_a, m.state_rows, 0))
+        da.num_tokens.copy_(la[:1]); da.num_seqs.copy_(act_a.to(torch.int32)[:1])
+
+        db.query_start_loc[0].zero_(); db.query_start_loc[1:].copy_(lb)
+        db.convolution_slots.copy_(torch.where(act_b, m.state_rows, -1))
+        db.fresh.zero_()
+        db.state_indices[:, 0].copy_(m.state_rows)
+        db.initial_state_indices.copy_(torch.where(act_b, m.state_rows, 0))
+        db.final_state_indices.copy_(torch.where(act_b, m.state_rows, 0))
+        db.num_tokens.copy_(lb[:1]); db.num_seqs.copy_(act_b.to(torch.int32)[:1])
+
         main = torch.cuda.current_stream(delta.device)
+        comm = torch.cuda.ExternalStream(self.comm_stream_handle, device=delta.device)
         comp = torch.cuda.ExternalStream(self.comp_stream_handle, device=delta.device)
         res_a = self.residual.substream(0, half)
         res_b = self.residual.substream(half, 2 * half)
@@ -760,10 +801,13 @@ class PreparedDecoder:
             main.wait_stream(comp)
 
         def overlap(comm_fn, comp_fn):
+            comm.wait_stream(main)
             comp.wait_stream(main)
-            comm_fn()
+            with torch.cuda.stream(comm):
+                comm_fn()
             with torch.cuda.stream(comp):
                 comp_fn()
+            main.wait_stream(comm)
             main.wait_stream(comp)
 
         def attn_mix_kwargs(idx, w, wave):
@@ -789,29 +833,24 @@ class PreparedDecoder:
 
         delta_a, delta_b = delta[:half], delta[half:]
         mix_a_done = False
-        in_a_done = False
+        kda_a_done = False
         mix_b_done = False
-        in_b_done = False
         for index, (w, kind, attention, mlp_spec, attn_red_a, attn_red_b, mlp_red_a, mlp_red_b) in enumerate(self.dual_layers):
             committed, boundary = -(-index // size), index % size == 0
-            out_p0, out_p1 = attention.out_pads
+            out_p0, out_p1 = attention[2:] if kind == 'kda' else attention.out_pads
             if not mix_a_done:
                 on_comp(lambda w=w, index=index, da=delta_a, md=mode: res_a.mix(da, md, **attn_mix_kwargs(index, w, 0)))
             if kind == 'kda':
-                def finish_kda_core(w=w, index=index, attention=attention, db=delta_b, md=mode,
-                                    in_a_done=in_a_done, mix_b_done=mix_b_done, in_b_done=in_b_done):
+                kda_a, kda_b = attention[:2]
+                if not kda_a_done:
+                    on_comp(lambda kda_a=kda_a: kda_a(attn_in[:half]))
+                def run_kda_wave_b(w=w, index=index, kda_b=kda_b, db=delta_b, md=mode, mix_b_done=mix_b_done):
                     if not mix_b_done:
                         res_b.mix(db, md, **attn_mix_kwargs(index, w, 1))
-                    if not in_a_done:
-                        attention.run_in_half(0, attn_in[:half])
-                    if not in_b_done:
-                        attention.run_in_half(1, attn_in[half:])
-                    attention.run_core()
-                    attention.run_out_half(0)
-                on_comp(finish_kda_core)
+                    kda_b(attn_in[half:])
                 overlap(
                     lambda attn_red_a=attn_red_a, out_p0=out_p0: attn_red_a(out_p0),
-                    lambda attention=attention: attention.run_out_half(1),
+                    run_kda_wave_b,
                 )
             elif attention.can_split_sparse:
                 if not mix_b_done:
@@ -859,16 +898,15 @@ class PreparedDecoder:
                 def pre_next_a(nw=nw, nkind=nkind, nattn=nattn, next_idx=next_idx):
                     res_a.mix(tot_a, ADD, **attn_mix_kwargs(next_idx, nw, 0))
                     if nkind == 'kda':
-                        nattn.run_in_half(0, attn_in[:half])
+                        nattn[0](attn_in[:half])
                 overlap(
                     lambda mlp_red_b=mlp_red_b, mlp_p1=mlp_p1: mlp_red_b(mlp_p1),
                     pre_next_a,
                 )
                 delta_a, delta_b, mode = tot_a, tot_b, ADD
                 mix_a_done = True
-                in_a_done = nkind == 'kda'
+                kda_a_done = nkind == 'kda'
                 mix_b_done = False
-                in_b_done = False
                 continue
 
             # MoE Layer: fully overlapped dual-wave pipeline
@@ -915,22 +953,26 @@ class PreparedDecoder:
             has_next = index + 1 < n_layers
             if has_next:
                 nw, nkind, nattn = self.dual_layers[index + 1][:3]
-                def pre_next_wave_a(nw=nw, nkind=nkind, nattn=nattn, next_idx=index + 1):
-                    res_a.mix(tot_a, ADD, **attn_mix_kwargs(next_idx, nw, 0))
-                    if nkind == 'kda':
-                        nattn.run_in_half(0, attn_in[:half])
-                overlap(m_b.phase_expert_reduce, pre_next_wave_a)
-                in_a_done = nkind == 'kda'
+                overlap(
+                    m_b.phase_expert_reduce,
+                    lambda nw=nw, next_idx=index + 1: res_a.mix(tot_a, ADD, **attn_mix_kwargs(next_idx, nw, 0)),
+                )
             else:
-                m_b.phase_expert_reduce()
-                in_a_done = False
+                overlap(m_b.phase_expert_reduce, lambda: None)
 
             on_comp(lambda m_b=m_b: m_b.phase_up_combine(m_b.shared.down.output))
-            mlp_red_b(mlp_p1)
+            if has_next and nkind == 'kda':
+                overlap(
+                    lambda mlp_red_b=mlp_red_b, mlp_p1=mlp_p1: mlp_red_b(mlp_p1),
+                    lambda nkda_a=nattn[0]: nkda_a(attn_in[:half]),
+                )
+                kda_a_done = True
+            else:
+                overlap(lambda mlp_red_b=mlp_red_b, mlp_p1=mlp_p1: mlp_red_b(mlp_p1), lambda: None)
+                kda_a_done = False
             delta_a, delta_b, mode = tot_a, tot_b, ADD
             mix_a_done = has_next
             mix_b_done = False
-            in_b_done = False
 
         final_sources = -(-n_layers // size)
         res_a.mix(delta_a, mode, sources=final_sources, write=-1,
