@@ -7,6 +7,8 @@ from functools import partial
 from types import SimpleNamespace
 
 import torch
+import triton
+import triton.language as tl
 from b12x.attention import dense_mla
 
 from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllGather
@@ -21,21 +23,50 @@ from ignition.recipes.kimi3.decoder import PreparedDecoder
 from ignition.recipes.kimi3.config import padded_width
 from ignition.recipes.kimi3.dcp import write_records
 from ignition.recipes.kimi3.latent_dspark import YarnRotary
-from ignition.recipes.kimi3.pointwise import rms_norm_columns
+from ignition.recipes.kimi3.pointwise import rms_norm_columns, unpack_and_rms_norm_qkv
+
+
+@triton.jit
+def _stage_latent_window_kernel(History, Latent, Output, Starts, Lengths, StateRows, QueryStartLoc,
+                                hist_row_stride, hist_pos_stride, lat_stride, out_row_stride, out_pos_stride,
+                                WINDOW: tl.constexpr, CAPACITY: tl.constexpr, LAT_ROWS: tl.constexpr,
+                                WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    off = tl.program_id(1).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < WIDTH
+    length = tl.load(Lengths + row).to(tl.int64)
+    start = tl.load(Starts + row).to(tl.int64)
+    prefix = tl.minimum(start, WINDOW)
+    valid = (length > 0) & (off < prefix + length)
+    if not valid:
+        z = tl.zeros((BLOCK,), dtype=tl.float32).to(Output.dtype.element_ty)
+        tl.store(Output + row * out_row_stride + off * out_pos_stride + cols, z, mask=mask)
+        return
+    if off < prefix:
+        s_row = tl.load(StateRows + row).to(tl.int64)
+        pos = start - prefix + off
+        rem = pos % WINDOW
+        rem = tl.where(rem < 0, rem + WINDOW, rem)
+        h_val = tl.load(History + s_row * hist_row_stride + rem * hist_pos_stride + cols, mask=mask, other=0.0)
+        val = h_val.to(tl.bfloat16).to(tl.float32)
+    else:
+        q_start = tl.load(QueryStartLoc + row).to(tl.int64)
+        idx = tl.minimum(tl.maximum(q_start + off - prefix, 0), LAT_ROWS - 1)
+        val = tl.load(Latent + idx * lat_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    clamped = tl.minimum(tl.maximum(val, -448.0), 448.0)
+    tl.store(Output + row * out_row_stride + off * out_pos_stride + cols, clamped.to(Output.dtype.element_ty), mask=mask)
 
 
 def stage_latent_window(history, latent, output, metadata):
     """Materialize a private chronological window; rejected candidates never mutate accepted history."""
     m, window, rows = metadata, history.shape[1], metadata.lengths.numel()
     capacity = output.shape[0] * output.shape[1] // rows
-    offsets = torch.arange(capacity, device=latent.device)[None]
-    prefix = m.starts[:, None].clamp(max=window)
-    positions = m.starts[:, None] - prefix + offsets
-    previous = history[m.state_rows[:, None], positions.remainder(window)].to(torch.bfloat16)
-    indices = (m.query_start_loc[:-1, None] + offsets - prefix).clamp(0, latent.shape[0] - 1).long()
-    valid = (m.lengths[:, None] > 0) & (offsets < prefix + m.lengths[:, None])
-    values = torch.where((offsets < prefix)[..., None], previous, latent[indices])
-    output.view(rows, capacity, 576).copy_(torch.where(valid[..., None], values, 0).float().clamp(-448., 448.))
+    out_view = output.view(rows, capacity, 576)
+    torch.library.wrap_triton(_stage_latent_window_kernel)[(rows, capacity)](
+        history, latent, out_view, m.starts, m.lengths, m.state_rows, m.query_start_loc,
+        history.stride(0), history.stride(1), latent.stride(0), out_view.stride(0), out_view.stride(1),
+        window, capacity, latent.shape[0], 576, 1024, num_warps=4)
 
 
 @dataclass
@@ -217,11 +248,9 @@ class DraftAttention:
     def __call__(self, source):
         m, w = self.metadata, self.weights
         gathered = self.gather(self.project(source)).view(source.shape[0], self.world, -1)
-        q, kv = self.local_q, self.local_kv
-        self.q_latent.view(-1, self.world, q).copy_(gathered[:, :, :q])
-        self.latent.view(-1, self.world, kv).copy_(gathered[:, :, q:q + kv])
-        rms_norm_columns(self.q_latent[:, :1536], w["query_norm"], self.q_norm, self.eps)
-        rms_norm_columns(self.latent[:, :512], w["kv_norm"], self.latent[:, :512], self.eps)
+        unpack_and_rms_norm_qkv(
+            gathered, self.local_q, self.local_kv,
+            w['query_norm'], w['kv_norm'], self.q_norm, self.latent, self.eps)
         self.query_project(self.q_norm)
         self.rotary.apply(self.query, m.positions)
         self.rotary.apply(self.latent, m.positions)

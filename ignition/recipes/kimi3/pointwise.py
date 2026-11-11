@@ -162,3 +162,84 @@ def distributed_rms_norm(shard, gathered_stats, weight, out, *, full_width, worl
         shard, gathered_stats, weight, out, shard.stride(0), out.stride(0), float(eps),
         full_width, local_width, world, group_rows, block, num_warps=4)
     return out
+
+
+@triton.jit
+def _unpack_norm_q(Gathered, Weight, Out, g_row_stride, g_rank_stride, out_stride, eps,
+                   LOCAL_Q: tl.constexpr, NORM_WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    valid = cols < NORM_WIDTH
+    rk = cols // LOCAL_Q
+    off = cols % LOCAL_Q
+    val = tl.load(Gathered + row * g_row_stride + rk * g_rank_stride + off, mask=valid, other=0.0).to(tl.float32)
+    normalized = (val * tl.rsqrt(tl.sum(val * val) / NORM_WIDTH + eps)).to(Out.dtype.element_ty)
+    weight = tl.load(Weight + cols, mask=valid, other=0.0).to(tl.float32)
+    tl.store(Out + row * out_stride + cols, (weight * normalized.to(tl.float32)).to(Out.dtype.element_ty), mask=valid)
+
+
+@triton.jit
+def _unpack_norm_kv_and_tail(Gathered, Weight, LatentOut, g_row_stride, g_rank_stride, lat_stride, eps,
+                             LOCAL_Q: tl.constexpr, LOCAL_KV: tl.constexpr,
+                             KV_NORM_WIDTH: tl.constexpr, TAIL_WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    valid = cols < KV_NORM_WIDTH
+    rk = cols // LOCAL_KV
+    off = LOCAL_Q + (cols % LOCAL_KV)
+    val = tl.load(Gathered + row * g_row_stride + rk * g_rank_stride + off, mask=valid, other=0.0).to(tl.float32)
+    normalized = (val * tl.rsqrt(tl.sum(val * val) / KV_NORM_WIDTH + eps)).to(LatentOut.dtype.element_ty)
+    weight = tl.load(Weight + cols, mask=valid, other=0.0).to(tl.float32)
+    tl.store(LatentOut + row * lat_stride + cols, (weight * normalized.to(tl.float32)).to(LatentOut.dtype.element_ty), mask=valid)
+    if TAIL_WIDTH > 0:
+        t_cols = tl.arange(0, 64)
+        t_valid = t_cols < TAIL_WIDTH
+        t_idx = KV_NORM_WIDTH + t_cols
+        t_rk = t_idx // LOCAL_KV
+        t_off = LOCAL_Q + (t_idx % LOCAL_KV)
+        t_val = tl.load(Gathered + row * g_row_stride + t_rk * g_rank_stride + t_off, mask=t_valid, other=0.0)
+        tl.store(LatentOut + row * lat_stride + t_idx, t_val, mask=t_valid)
+
+
+def unpack_and_rms_norm_qkv(gathered, local_q: int, local_kv: int, q_weight, kv_weight, q_norm_out, latent_out, eps: float):
+    """Unpack rank-interleaved [rows, world, width] latents and apply exact 4-warp Q/KV RMSNorm + RoPE tail copy."""
+    rows, world, width = gathered.shape
+    q_width = q_norm_out.shape[1]
+    kv_norm_width = kv_weight.shape[0]
+    tail_width = latent_out.shape[1] - kv_norm_width
+    if (local_q + local_kv > width or q_width > world * local_q or latent_out.shape[1] > world * local_kv
+            or not 0 <= tail_width <= 64 or q_weight.shape != (q_width,)
+            or q_norm_out.shape[0] != rows or latent_out.shape[0] != rows
+            or gathered.stride(2) != 1 or q_norm_out.stride(1) != 1 or latent_out.stride(1) != 1):
+        raise ValueError("fused latent unpacking requires rank shards that cover the query and KV latents, "
+                         "contiguous rows and a tail of at most 64 columns")
+    q_block = triton.next_power_of_2(q_width)
+    kv_block = triton.next_power_of_2(kv_norm_width)
+    torch.library.wrap_triton(_unpack_norm_q)[(rows,)](
+        gathered, q_weight, q_norm_out, gathered.stride(0), gathered.stride(1), q_norm_out.stride(0), float(eps),
+        local_q, q_width, q_block, num_warps=4 if q_block <= 2048 else 8)
+    torch.library.wrap_triton(_unpack_norm_kv_and_tail)[(rows,)](
+        gathered, kv_weight, latent_out, gathered.stride(0), gathered.stride(1), latent_out.stride(0), float(eps),
+        local_q, local_kv, kv_norm_width, tail_width, kv_block, num_warps=4 if kv_block <= 2048 else 8)
+
+
+@triton.jit
+def _clamp_cast_fp8_e4m3_kernel(Src, Dst, src_stride, dst_stride, COLS: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    blk = tl.program_id(1)
+    cols = blk * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < COLS
+    v = tl.load(Src + row * src_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    v = tl.minimum(tl.maximum(v, -448.0), 448.0)
+    tl.store(Dst + row * dst_stride + cols, v.to(Dst.dtype.element_ty), mask=mask)
+
+
+def clamp_cast_fp8_e4m3(source: torch.Tensor, destination: torch.Tensor) -> torch.Tensor:
+    rows = source.shape[0]
+    cols = source.numel() // rows
+    src_2d = source.reshape(rows, cols)
+    dst_2d = destination.reshape(rows, cols)
+    block = min(1024, max(128, triton.next_power_of_2(cols)))
+    torch.library.wrap_triton(_clamp_cast_fp8_e4m3_kernel)[(rows, triton.cdiv(cols, block))](
+        src_2d, dst_2d, src_2d.stride(0), dst_2d.stride(0), cols, block, num_warps=4)
+    return destination

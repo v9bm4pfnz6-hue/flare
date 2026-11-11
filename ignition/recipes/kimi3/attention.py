@@ -18,10 +18,11 @@ from b12x.attention import dense_mla
 
 from ignition.components.collectives import PreparedAllGather, PreparedChunkedAllGather, PreparedLseReduceScatter
 from ignition.components.dense_mla import PreparedDenseMLA
+from ignition.components.linear import BatchedUnquantizedProjection
 
 from .config import PAGE_TOKENS
 from .dcp import RECORD_BYTES, ContextShards, lse_geometry, pull_context, write_records
-from .pointwise import rms_norm_columns, sigmoid_gate
+from .pointwise import clamp_cast_fp8_e4m3, rms_norm_columns, sigmoid_gate, unpack_and_rms_norm_qkv
 from .projections import prepare_projection
 
 FP8 = torch.float8_e4m3fn
@@ -119,7 +120,15 @@ class PreparedMLA:
                                                             session=session, name=name + ".output", workspace=workspace)
         self.shards = ContextShards() if context is None else context.shards
         self.peers = peers
-        self.slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
+        self.shared_slots = selection is not None and getattr(selection, 'slots', None) is not None
+        self.slots = (selection.slots[:tokens] if self.shared_slots
+                      else torch.full((tokens,), -1, dtype=torch.int64, device=device))
+        self.absorb = BatchedUnquantizedProjection(
+            self.query[:, :, :128].transpose(0, 1), weights['key'],
+            self.absorbed[:, :, :512].transpose(0, 1), major='n', session=session, name=name + '.absorb')
+        self.expand = BatchedUnquantizedProjection(
+            self.attended.transpose(0, 1), weights['value'],
+            self.expanded.view(tokens, heads, 128).transpose(0, 1), major='n', session=session, name=name + '.expand')
         world, width = self.shards.world, metadata.page_table.shape[1]
         common = dict(device=device, kv_dtype=FP8, page_size=PAGE_TOKENS, use_cuda_graph=True,
                       partial_dtype=torch.float32)
@@ -192,28 +201,32 @@ class PreparedMLA:
             _copy_slot_blocks(self.query_input, slots[:, :, :q], q, first)
             _copy_slot_blocks(self.kv_input, slots[:, :, q:q + kv], kv, first)
             self.latent_ring.release()
+            rms_norm_columns(self.query_input[:, :self.query_norm.shape[1]], self.weights['query_norm'], self.query_norm, self.eps)
+            rms_norm_columns(self.kv_input[:, :512], self.weights['kv_norm'], self.latent[:, :512], self.eps)
+            self.latent[:, 512:].copy_(self.kv_input[:, 512:])
         elif self.latent_gather is not None:
             tokens, width = self.send.shape
             if self.staged:
                 self.send.copy_(self.local[:, :width])
             self.latent_gather(self.send)
-            # Rank-major latent shards back into the query and KV latents they partition.
             world = self.gathered_latents.shape[1] // width
             gathered = self.gathered_latents.view(tokens, world, width)
-            q, kv = self.local_q, self.local_kv
-            self.query_input.view(tokens, world, q).copy_(gathered[:, :, :q])
-            self.kv_input.view(tokens, world, kv).copy_(gathered[:, :, q:q + kv])
-        rms_norm_columns(self.query_input[:, :self.query_norm.shape[1]], self.weights["query_norm"], self.query_norm, self.eps)
-        rms_norm_columns(self.kv_input[:, :512], self.weights["kv_norm"], self.latent[:, :512], self.eps)
-        self.latent[:, 512:].copy_(self.kv_input[:, 512:])
+            unpack_and_rms_norm_qkv(
+                gathered, self.local_q, self.local_kv,
+                self.weights['query_norm'], self.weights['kv_norm'],
+                self.query_norm, self.latent, self.eps)
+        else:
+            rms_norm_columns(self.query_input[:, :self.query_norm.shape[1]], self.weights['query_norm'], self.query_norm, self.eps)
+            rms_norm_columns(self.kv_input[:, :512], self.weights['kv_norm'], self.latent[:, :512], self.eps)
+            self.latent[:, 512:].copy_(self.kv_input[:, 512:])
         p["q_b"](self.query_norm)
         if self.rotary is not None:
             self.rotary.apply(self.query, m.positions)
             self.rotary.apply(self.latent, m.positions)
-        self.absorbed[:, :, :512].copy_(torch.bmm(self.query[:, :, :128].transpose(0, 1), self.weights["key"]).transpose(0, 1))
+        self.absorb(self.query[:, :, :128].transpose(0, 1))
         self.absorbed[:, :, 512:].copy_(self.query[:, :, 128:])
-        # Each rank stores the positions it owns; every position is owned when no ranks share the context.
-        self.slots.copy_(shards.token_slots(m.positions, m.token_page_table))
+        if not self.shared_slots:
+            self.slots.copy_(shards.token_slots(m.positions, m.token_page_table))
         write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
         if self.sparse is not None:
             self.sparse()
@@ -224,14 +237,13 @@ class PreparedMLA:
             self.prefill(self.latent)
         else:
             tokens = self.absorbed.shape[0]
-            self.quantized.copy_(self.absorbed.float().clamp(-448., 448.).to(FP8))
+            clamp_cast_fp8_e4m3(self.absorbed, self.quantized)
             self.gather(self.quantized.view(tokens, -1))
             self.token_pages.copy_(m.token_page_table)
             self.token_lengths.copy_(shards.local_tokens(m.positions + 1).to(torch.int32))
             self.attention()
             self.combine(self.partial, self.lse)
-        att_rows, att_heads = self.attended.shape[:2]
-        self.expanded.view(att_rows, att_heads, 128).copy_(torch.bmm(self.attended.transpose(0, 1), self.weights["value"]).transpose(0, 1))
+        self.expand(self.attended.transpose(0, 1))
         if self.gated:
             sigmoid_gate(self.expanded, self.gate)
         return self.expanded

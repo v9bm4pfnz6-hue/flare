@@ -4,7 +4,10 @@
 """Gated Kimi DSA: learned selection over context-sharded FP8 keys and latent records."""
 
 import torch
+import triton
+import triton.language as tl
 from b12x.attention import dense_mla
+from b12x.attention.dsa_indexer._glm_pool_kernels import _write_pool
 from ignition.preparation.scratch import ScratchArena
 
 from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
@@ -15,7 +18,26 @@ from ignition.components.fp8_indexer import PreparedFP8Indexer
 
 from .config import PAGE_TOKENS
 from .dcp import ContextShards, RECORD_BYTES, lse_geometry, pull_context
+from .pointwise import clamp_cast_fp8_e4m3
 from .projections import prepare_projection
+
+
+@triton.jit
+def _layernorm128_write_keys(KeyInput, NormWeight, NormBias, KeyBf16Out, Cache, ScaleCache, Slots,
+                             in_stride, key_stride, cache_stride, eps, ROTATE: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    dim = tl.arange(0, 128)
+    x = tl.load(KeyInput + row * in_stride + dim).to(tl.float32)
+    w = tl.load(NormWeight + dim).to(tl.float32)
+    b = tl.load(NormBias + dim).to(tl.float32)
+    mean = tl.sum(x, axis=0) * (1.0 / 128.0)
+    diff = x - mean
+    var = tl.sum(diff * diff, axis=0) * (1.0 / 128.0)
+    y_bf16 = ((diff * tl.rsqrt(var + eps)) * w + b).to(KeyBf16Out.dtype.element_ty)
+    tl.store(KeyBf16Out + row * key_stride + dim, y_bf16)
+    slot = tl.load(Slots + row)
+    _write_pool(Cache, ScaleCache, slot, y_bf16, dim, dim < 128, slot >= 0,
+                cache_stride, 64, 128, 448.0, ROTATE)
 
 # Slice selection and its cross-rank candidate exchange so prefill scratch is context-independent.
 SELECTION_ROWS = 32
@@ -222,7 +244,7 @@ class PreparedDSA:
         destination, output = quantized.view(count, -1), gathered.view(count, -1)
 
         def run(count=count, source=source, destination=destination, output=output, gather=gather):
-            destination.copy_(source.reshape(count, -1).float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+            clamp_cast_fp8_e4m3(source.reshape(count, -1), destination)
             gather(destination)
 
         handle = len(_QUERY_BRANCHES)
@@ -235,9 +257,12 @@ class PreparedDSA:
             return self.prefill()
         m, shards = self.metadata, self.shards
         self.project(self.query_residual)
-        self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (INDEX_DIM,),
-            self.norm_weight.float(), self.norm_bias.float(), self.eps).to(self.key.dtype))
-        self.stages[0][2].write_keys(self.key, self.slots)
+        st0 = self.stages[0][2]
+        torch.library.wrap_triton(_layernorm128_write_keys)[(self.rows,)](
+            self.key_input, self.norm_weight, self.norm_bias, self.key,
+            st0.cache.view(torch.float8_e4m3fn), st0.cache.view(torch.float32), self.slots,
+            self.key_input.stride(0), self.key.stride(0), st0.cache.stride(0), float(self.eps),
+            st0.rotation == 'hadamard', num_warps=4)
         for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired, branch in self.stages:
             count = end - begin
             positions, pages = m.positions[begin:end], m.token_page_table[begin:end]
@@ -247,12 +272,24 @@ class PreparedDSA:
                 self.lengths[:count].copy_(shards.local_tokens((positions + 1).clamp_min(0)).to(torch.int32))
                 self.active.copy_(self.lengths[:count].max().reshape(1))
             if paired is not None:
-                quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+                clamp_cast_fp8_e4m3(self.query[begin:end], quantized)
                 paired(quantized.view(count, -1), self.local_index_query[begin:end].view(count, -1))
             selector()
-            selected = self.local[:count] if merge is None else merge()
+            started_branch = False
+            if merge is None:
+                selected = self.local[:count]
+                if branch is not None and not self.gathered_context:
+                    _start_dsa_query_branch(branch, self.stream_handle, self.query[begin:end], quantized)
+                    started_branch = True
+            else:
+                merge.collect()
+                if branch is not None and not self.gathered_context:
+                    # Start quantize + query all-gather on auxiliary_stream right after score exchange,
+                    # overlapping with DSATiledTopk + _select_share + selected_local_records on main.
+                    _start_dsa_query_branch(branch, self.stream_handle, self.query[begin:end], quantized)
+                    started_branch = True
+                selected = merge.merge_result()
             if self.gathered_context:
-                # The candidate exchange orders all ranks' cache writes before peer reads.
                 if begin == 0:
                     self.window[0:1].zero_()
                     self.window[1:].copy_((m.positions.max() + 1).clamp_min(0).reshape(1))
@@ -265,19 +302,17 @@ class PreparedDSA:
                 self.physical[:count].copy_(physical)
                 self.counts[:count].copy_(lengths)
             else:
-                # The record mapper writes the attention operands directly, without a staging copy.
                 selected_local_records(selected, positions, pages, world=shards.world,
                     rank=shards.owner, page_size=PAGE_TOKENS,
                     output=self.physical[:count], counts=self.counts[:count])
-            if branch is not None:
-                # Quantize and heads-runtime all-gather run on the arena auxiliary stream while
-                # the main stream finishes the candidate exchange and record mapping.
+            if branch is not None and not started_branch:
                 _start_dsa_query_branch(branch, self.stream_handle, self.query[begin:end], quantized)
-            elif quantized is not None and paired is None:
-                quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+                started_branch = True
+            elif branch is None and quantized is not None and paired is None:
+                clamp_cast_fp8_e4m3(self.query[begin:end], quantized)
                 if gather is not None:
                     gather(quantized.view(count, -1))
-            if branch is not None:
+            if started_branch:
                 _join_dsa_query_branch(quantized, self.stream_handle)
             attention()
             if combine is not None:
