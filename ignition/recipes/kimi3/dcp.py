@@ -217,11 +217,13 @@ class ContextParallel:
 # matched 512x8 bitwise and did not regress in two interleaved 50-sample runs;
 # evidence is validation/lse-geometry-summary-20261109.json in the candidate tree.
 _LSE_GEOMETRY_BY_ROWS = {
-    1: (512, 16),
-    2: (384, 32),
-    3: (512, 16),
-    4: (512, 16),
-    6: (128, 32),
+    24: (256, 32),
+    5: (256, 8),
+    1: (128, 32),
+    2: (128, 16),
+    3: (128, 32),
+    4: (256, 8),
+    6: (384, 8),
     7: (384, 16),
     9: (384, 16),
     10: (128, 32),
@@ -230,7 +232,7 @@ _LSE_GEOMETRY_BY_ROWS = {
     13: (384, 32),
     14: (384, 32),
     15: (384, 16),
-    16: (512, 16),
+    16: (256, 32),
     17: (384, 16),
     18: (512, 16),
     19: (512, 16),
