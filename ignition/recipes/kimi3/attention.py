@@ -31,7 +31,7 @@ class PreparedMLA:
     def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
                  coordinator=None, context=None, peers=None, allocator=None, index_cache=None, index_peers=None,
                  eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None, selection=None, gather_ring=None,
-                 dual_wave=False):
+                 dual_wave=False, out_pad_rows=0):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
         device = source.device
@@ -95,21 +95,26 @@ class PreparedMLA:
                 self.gathered_latents = buffer("gathered_latents", world * width, rows=rows)
                 self.latent_gather = PreparedChunkedAllGather(self.send, self.gathered_latents, runtime=latents,
                     session=session, coordinator=coordinator, name=name + ".gather_latents")
-        out_buf = buffer("output", hidden)
-        self.output_buffer = out_buf
         self.dual_wave = bool(dual_wave and mode == 'prefill' and tokens % 2 == 0)
         self.projections = {key: prepare_projection(x, weights[key], y, session=session,
             name=name + "." + key, workspace=workspace)
             for key, x, y in (("latent_gate", source, self.local), ("q_b", self.query_norm, self.query.view(tokens, -1)))}
         if self.dual_wave:
             self.half = tokens // 2
+            pad_r = max(self.half, int(out_pad_rows))
+            self.out_pads = (
+                buffer('output_w0', hidden, rows=pad_r)[:pad_r],
+                buffer('output_w1', hidden, rows=pad_r)[:pad_r],
+            )
             self.out_halves = (
-                prepare_projection(self.expanded[:self.half], weights['output'], out_buf[:self.half],
+                prepare_projection(self.expanded[:self.half], weights['output'], self.out_pads[0][:self.half],
                                    session=session, name=name + '.output.w0', workspace=workspace),
-                prepare_projection(self.expanded[self.half:], weights['output'], out_buf[self.half:],
+                prepare_projection(self.expanded[self.half:], weights['output'], self.out_pads[1][:self.half],
                                    session=session, name=name + '.output.w1', workspace=workspace),
             )
         else:
+            out_buf = buffer("output", hidden)
+            self.output_buffer = out_buf
             self.projections["output"] = prepare_projection(self.expanded, weights["output"], out_buf,
                                                             session=session, name=name + ".output", workspace=workspace)
         self.shards = ContextShards() if context is None else context.shards
@@ -230,6 +235,52 @@ class PreparedMLA:
         if self.gated:
             sigmoid_gate(self.expanded, self.gate)
         return self.expanded
+
+    @property
+    def can_split_sparse(self) -> bool:
+        return bool(
+            self.dual_wave and self.sparse is not None
+            and getattr(self.sparse, 'prefill', None) is not None
+            and self.sparse.prefill.ring_gather is not None
+            and self.half % self.sparse.prefill.step == 0
+        )
+
+    def prepare_sparse_dual(self, source):
+        p, m, shards = self.projections, self.metadata, self.shards
+        p['latent_gate'](source)
+        if getattr(self, 'latent_ring', None) is not None:
+            from .routing import _copy_slot_blocks
+            slots = self.latent_ring.slots
+            world, tokens, width = slots.shape
+            slots[world - 1].copy_(self.local[:, :width])
+            self.latent_ring()
+            q, kv = self.local_q, self.local_kv
+            _copy_slot_blocks(self.query_input, slots[:, :, :q], q, self.latent_ring.first_rank)
+            _copy_slot_blocks(self.kv_input, slots[:, :, q:q + kv], kv, self.latent_ring.first_rank)
+            self.latent_ring.release()
+        rms_norm_columns(self.query_input[:, :self.query_norm.shape[1]], self.weights['query_norm'], self.query_norm, self.eps)
+        rms_norm_columns(self.kv_input[:, :512], self.weights['kv_norm'], self.latent[:, :512], self.eps)
+        self.latent[:, 512:].copy_(self.kv_input[:, 512:])
+        p['q_b'](self.query_norm)
+        if self.rotary is not None:
+            self.rotary.apply(self.query, m.positions)
+            self.rotary.apply(self.latent, m.positions)
+        self.absorbed[:, :, :512].copy_(torch.bmm(self.query[:, :, :128].transpose(0, 1), self.weights['key']).transpose(0, 1))
+        self.absorbed[:, :, 512:].copy_(self.query[:, :, 128:])
+        self.slots.copy_(shards.token_slots(m.positions, m.token_page_table))
+        write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
+        self.sparse.prefill.select_and_gather()
+
+    def run_sparse_out_half(self, wave: int):
+        sl = slice(0, self.half) if wave == 0 else slice(self.half, 2 * self.half)
+        self.sparse.prefill.attend_range(sl.start, sl.stop)
+        att_sub = self.attended[sl]
+        att_rows, att_heads = att_sub.shape[:2]
+        self.expanded[sl].view(att_rows, att_heads, 128).copy_(
+            torch.bmm(att_sub.transpose(0, 1), self.weights['value']).transpose(0, 1))
+        if self.gated:
+            sigmoid_gate(self.expanded[sl], self.gate[sl])
+        return self.out_halves[wave](self.expanded[sl])
 
     def run_out_half(self, wave: int):
         sl = slice(0, self.half) if wave == 0 else slice(self.half, 2 * self.half)

@@ -160,10 +160,12 @@ class PreparedGatheredDSA:
         total_local_rows = self.num_slices * self.local_rows
         ring_nbytes = total_local_rows * 2048 * 4
         self.ring_gather = None
+        self.saved_slots = None
         if (gather_ring is not None and world > 1 and ring_nbytes % 16 == 0
                 and RING_GATHER_MIN_BYTES <= ring_nbytes <= gather_ring.gather_capacity):
             self.ring_gather = PreparedRingGather((total_local_rows, 2048), torch.int32, runtime=gather_ring,
                 session=session, coordinator=coordinator, name=name + ".selected_positions.ring")
+            self.saved_slots = zeros((world, total_local_rows, 2048), torch.int32)
             self.gather = None
             self.gathered = None
         else:
@@ -197,6 +199,62 @@ class PreparedGatheredDSA:
         self.lengths.copy_(torch.where(self.selected_rows < self.rows, (m.positions[safe] + 1).clamp_min(0), 0))
         self.active.copy_(self.lengths.max().reshape(1))
         self.selector()
+
+    def select_and_gather(self):
+        from ignition.components.fp8_indexer import _write_keys
+
+        m, c = self.metadata, self.context
+        self.project(self.residual)
+        if self.partitioned:
+            columns = self.head_columns + c.shards.owner * self.head_columns.numel()
+            self.folded_weights.copy_(self.head_weights[:, columns])
+            glm_pool.quantize_queries(*self.query_arguments, plan=self.query_plan)
+            self.exchange(self.local_quantized.view(self.rows, -1), self.folded_weights)
+        _launch(_layer_norm_128_bf16, (self.rows,),
+                (self.key_input, self.norm_weight, self.norm_bias, self.key,
+                 self.key_input.stride(0), self.key.stride(0), float(self.eps)), num_warps=4)
+        torch.library.wrap_triton(_write_keys)[(self.rows,)](self.key,
+            self.index_cache.view(torch.float8_e4m3fn), self.index_cache.view(torch.float32),
+            self.slots, self.index_cache.stride(0), False, num_warps=4)
+        self.window[0:1].zero_()
+        self.window[1:].copy_(m.starts * (m.lengths > 0))
+        pull_context(self.peers, m.page_table[0], self.window, c.slab.view(torch.int32), c.shards)
+        pull_index_context(self.index_peers, m.page_table[0], self.window[1:], c.index_slab, c.shards)
+        write_records(self.latent, m.positions, c.slab)
+        torch.library.wrap_triton(_write_keys)[(self.rows,)](self.key,
+            c.index_slab.view(torch.float8_e4m3fn), c.index_slab.view(torch.float32),
+            m.positions, c.index_slab.stride(0), False, num_warps=4)
+        self.pages.copy_(self.page_ids[None])
+        slots = self.ring_gather.slots
+        own = slots[self.world - 1]
+        for slice_idx, begin in enumerate(range(0, self.rows, self.step)):
+            self._select_slice(begin)
+            own[slice_idx * self.local_rows : (slice_idx + 1) * self.local_rows].copy_(self.selected)
+        self.ring_gather()
+        self.saved_slots.copy_(slots)
+        self.ring_gather.release()
+
+    def attend_range(self, row_begin: int, row_end: int):
+        m = self.metadata
+        slots = self.saved_slots
+        first_rank = self.ring_gather.first_rank
+        slot_stride = slots.stride(0)
+        total_q_cols = self.heads * RECORD_BYTES
+        q_flat = self.query.view(self.rows, total_q_cols)
+        quant_flat = self.quantized.view(self.step, total_q_cols)
+        q_block = 512
+        for begin in range(row_begin, row_end, self.step):
+            end = min(begin + self.step, row_end)
+            count = end - begin
+            _launch(_filter_sort_selected, (self.step,),
+                    (slots, self.physical, self.counts, m.positions, slot_stride, begin, count, self.rows),
+                    FIRST_RANK=first_rank, LOCAL_ROWS=self.local_rows, RING=True,
+                    WORLD=self.world, TOPK=2048, num_warps=8)
+            _launch(_quantize_prefill_queries, (self.step, triton.cdiv(total_q_cols, q_block)),
+                    (q_flat, quant_flat, begin, count, q_flat.stride(0), quant_flat.stride(0)),
+                    TOTAL_COLS=total_q_cols, BLOCK=q_block, num_warps=4)
+            self.attention()
+            self.output[begin:end].copy_(self.attended[:count])
 
     def __call__(self):
         from ignition.components.fp8_indexer import _write_keys
