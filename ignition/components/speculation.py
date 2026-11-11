@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 
 from ignition.components.flashinfer_sampling import filter_probabilities_out, sample_probabilities, probability_filter_workspace, verify_chain
 
@@ -39,6 +41,118 @@ DRAFT_RNG_DOMAIN = 0x4D54505F44524146
 # Vocabulary-wide checks reduce each row in slices first, so compiled forwards spread
 # them over many programs instead of one serial program per row.
 VOCABULARY_SLICES = 128
+
+
+@triton.jit
+def _prepare_speculative_meta_kernel(Safe, Live, Candidates, TopK, Params, GrammarEnabled, GrammarCounts,
+                                     PackedTopK, PackedTopP, RowFlags, Maximum,
+                                     cand_stride, param_stride,
+                                     WIDTH: tl.constexpr, VOCAB: tl.constexpr, PREFIX_OFFSET: tl.constexpr,
+                                     INDICES: tl.constexpr, MASK_ROWS: tl.constexpr, COND_GRAMMAR: tl.constexpr):
+    idx = tl.program_id(0)
+    b = idx // WIDTH
+    w = idx % WIDTH
+    s = tl.load(Safe + b).to(tl.int64)
+    lv = tl.load(Live + b).to(tl.int1) != 0
+    pref = w + PREFIX_OFFSET
+    p_valid = True
+    for j in tl.static_range(0, INDICES):
+        if j < pref:
+            cid = tl.load(Candidates + b * cand_stride + j)
+            p_valid = p_valid & (cid >= 0) & (cid < VOCAB)
+    g_en = tl.load(GrammarEnabled + s).to(tl.int32) != 0
+    if COND_GRAMMAR:
+        g_cnt = tl.load(GrammarCounts + s).to(tl.int32)
+        g_ok = (~g_en) | ((pref < g_cnt) & (g_cnt <= MASK_ROWS))
+    elif WIDTH > 1:
+        g_ok = (~g_en) | (pref == 0)
+    else:
+        g_ok = True
+    pre_ok = lv & p_valid & g_ok
+    tk = tl.load(TopK + s).to(tl.int32)
+    tk_out = tl.where(tk > 0, tk, VOCAB)
+    tp_out = tl.load(Params + b * param_stride + 1).to(tl.float32)
+    tl.store(PackedTopK + idx, tk_out)
+    tl.store(PackedTopP + idx, tp_out)
+    tl.store(RowFlags + idx * 3, tl.where(pre_ok, 1, 0))
+    tl.store(RowFlags + idx * 3 + 1, 0)
+    tl.store(RowFlags + idx * 3 + 2, 0)
+    tl.store(Maximum + idx, float('-inf'))
+
+
+@triton.jit
+def _prepare_speculative_scores_kernel(Logits, Histogram, Candidates, Safe, Params, GrammarEnabled, GrammarMasks,
+                                       RowFlags, ScoresOut, Maximum,
+                                       log_b_stride, log_w_stride, hist_stride, cand_stride, param_stride,
+                                       gm_s_stride, gm_r_stride,
+                                       WIDTH: tl.constexpr, VOCAB: tl.constexpr, PREFIX_OFFSET: tl.constexpr,
+                                       INDICES: tl.constexpr, COND_GRAMMAR: tl.constexpr,
+                                       WRITE_DUMMY: tl.constexpr, BLOCK: tl.constexpr):
+    idx = tl.program_id(0)
+    blk = tl.program_id(1)
+    cols = blk * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < VOCAB
+    b = idx // WIDTH
+    w = idx % WIDTH
+    pre_ok = tl.load(RowFlags + idx * 3) != 0
+    if WRITE_DUMMY and (not pre_ok):
+        dummy = tl.where(cols == 0, 0.0, float('-inf'))
+        tl.store(ScoresOut + (b * WIDTH + w) * VOCAB + cols, dummy, mask=mask)
+        return
+    s = tl.load(Safe + b).to(tl.int64)
+    pref = w + PREFIX_OFFSET
+    cnt = tl.load(Histogram + s * hist_stride + cols.to(tl.int64), mask=mask, other=0.0).to(tl.float32)
+    for j in tl.static_range(0, INDICES):
+        if j < pref:
+            cid = tl.load(Candidates + b * cand_stride + j)
+            if (cid >= 0) & (cid < VOCAB):
+                cnt = cnt + tl.where(cols.to(tl.int64) == cid, 1.0, 0.0)
+    p_base = Params + b * param_stride
+    temp = tl.load(p_base + 0).to(tl.float32)
+    penalty = tl.load(p_base + 3).to(tl.float32)
+    p_pres = tl.load(p_base + 4).to(tl.float32)
+    p_freq = tl.load(p_base + 5).to(tl.float32)
+    sc = tl.load(Logits + b * log_b_stride + w * log_w_stride + cols.to(tl.int64), mask=mask, other=float('-inf')).to(tl.float32)
+    adj = tl.where(sc > 0.0, sc / penalty, sc * penalty)
+    has_cnt = cnt > 0.0
+    sc = tl.where(has_cnt, adj, sc)
+    sc = sc - tl.where(has_cnt, 1.0, 0.0) * p_pres - cnt * p_freq
+    sc = sc / tl.where(temp > 0.0, temp, 1.0)
+    g_en = tl.load(GrammarEnabled + s).to(tl.int32) != 0
+    if g_en:
+        g_row = pref if COND_GRAMMAR else 0
+        words = tl.load(GrammarMasks + s * gm_s_stride + g_row * gm_r_stride + (cols >> 5), mask=mask, other=0)
+        allowed = ((words >> (cols & 31)) & 1) != 0
+        sc = tl.where(allowed, sc, float('-inf'))
+    tl.store(ScoresOut + (b * WIDTH + w) * VOCAB + cols, sc, mask=mask)
+    valid_sc = tl.where(mask, sc, float('-inf'))
+    bmax = tl.max(valid_sc, axis=0)
+    tl.atomic_max(Maximum + idx, bmax)
+    if bmax > float('-inf'):
+        tl.atomic_or(RowFlags + idx * 3 + 1, 1)
+    bad = tl.sum(tl.where(mask & ((sc != sc) | (sc == float('inf'))), 1, 0), axis=0)
+    if bad > 0:
+        tl.atomic_or(RowFlags + idx * 3 + 2, 1)
+
+
+@triton.jit
+def _finalize_speculative_valid_kernel(RowFlags, ValidOut, ScoresOut, Maximum,
+                                       VOCAB: tl.constexpr, WRITE_DUMMY: tl.constexpr, BLOCK: tl.constexpr):
+    idx = tl.program_id(0)
+    pre_ok = tl.load(RowFlags + idx * 3) != 0
+    has_fin = tl.load(RowFlags + idx * 3 + 1) != 0
+    has_bad = tl.load(RowFlags + idx * 3 + 2) != 0
+    if has_bad:
+        tl.store(Maximum + idx, float('nan'))
+    is_valid = pre_ok & has_fin & (~has_bad)
+    tl.store(ValidOut + idx, is_valid)
+    if WRITE_DUMMY and pre_ok and (not is_valid):
+        c = 0
+        while c < VOCAB:
+            cols = c + tl.arange(0, BLOCK)
+            m = cols < VOCAB
+            tl.store(ScoresOut + idx * VOCAB + cols, tl.where(cols == 0, 0.0, float('-inf')), mask=m)
+            c += BLOCK
 
 
 def _sliced(values: torch.Tensor) -> torch.Tensor:
@@ -130,7 +244,8 @@ class PreparedSpeculativeDistributions:
         return dict(scores=((batch, width, vocab), torch.float32),
             probabilities=((batch, width, vocab), torch.float32),
             maximum=((batch, width), torch.float32), valid=((batch, width), torch.bool),
-            packed_top_k=((batch * width,), torch.int32), packed_top_p=((batch * width,), torch.float32))
+            packed_top_k=((batch * width,), torch.int32), packed_top_p=((batch * width,), torch.float32),
+            row_flags=((batch * width * 3,), torch.int32))
 
     def __init__(self, logits, requests, slots, generations, live_rows, candidate_prefix_ids,
                  *, prefix_offset=0, grammar_masks=None, grammar_mask_count=None, workspace=None):
@@ -169,54 +284,33 @@ class PreparedSpeculativeDistributions:
         self.normalization = PreparedProbabilityNormalization(self.probabilities, self.valid)
         self._prepared = False
 
-    def prepare_scores(self):
-        state, columns = self.state, self.columns
+    def prepare_scores(self, *, write_dummy_invalid: bool = False):
+        state = self.state
+        batch, width, vocab = self.logits.shape
         safe, live = _live(state, self.slots, self.generations, self.live_rows, self.rows)
-        counts = state.histogram[safe, None, :]
-        prefix = columns + self.prefix_offset
-        # The candidate histogram is an integer count over the vocabulary: candidate i
-        # contributes one to every column whose prefix includes it, and every column
-        # requires each candidate it includes to be valid. Computing it as a sparse
-        # scatter keeps the exact integer counts while avoiding one full-vocabulary
-        # comparison pass per candidate position.
-        indices = columns.numel() - 1 + self.prefix_offset
-        used = (torch.arange(indices, device=prefix.device)[None, :] < prefix[:, None])
-        candidate_ids = self.candidates[:, :indices]
-        candidate_valid = (candidate_ids >= 0) & (candidate_ids < state.vocab_size)
-        prefix_valid = (candidate_valid[:, None, :] | ~used[None, :, :]).all(-1)
-        contributions = used[None, :, :] & candidate_valid[:, None, :]
-        positions = torch.where(contributions, candidate_ids[:, None, :],
-                                torch.zeros_like(candidate_ids)[:, None, :])
-        additions = torch.zeros((self.logits.shape[0], self.logits.shape[1], state.vocab_size),
-                                dtype=torch.float32, device=counts.device)
-        additions.scatter_add_(2, positions, contributions.to(torch.float32))
-        counts = counts + additions
         params = state.parameters[safe]
-        # BF16 logits convert to FP32 exactly, so the score chain below runs in the
-        # same FP32 arithmetic without materializing a separate FP32 logits copy.
-        scores = self.logits
-        penalty = params[:, None, 3:4]
-        adjusted = torch.where(scores > 0, scores / penalty, scores * penalty)
-        scores = torch.where(counts > 0, adjusted, scores)
-        scores = scores - (counts > 0) * params[:, None, 4:5] - counts * params[:, None, 5:6]
-        temperature = params[:, None, :1]
-        scores = scores / torch.where(temperature > 0, temperature, 1)
-        if self.grammar_masks is None:
-            words = state.grammar_mask[safe][:, None, self.vocab_ids // 32]
-        else:
-            words = self.grammar_masks[safe][:, prefix][:, :, self.vocab_ids // 32]
-        allowed = ((words >> (self.vocab_ids % 32)) & 1).bool() | ~state.grammar_enabled[safe, None, None].bool()
-        self.scores.copy_(torch.where(allowed, scores, -torch.inf))
-        self.maximum.copy_(_sliced(self.scores).amax(-1).amax(-1))
-        self.valid.copy_(live[:, None] & prefix_valid & torch.isfinite(self.maximum))
-        if self.grammar_masks is not None:
-            count = self.grammar_mask_count[safe, None]
-            self.valid.logical_and_(~state.grammar_enabled[safe, None].bool()
-                                    | ((prefix[None, :] < count) & (count <= self.grammar_masks.shape[1])))
-        elif columns.numel() > 1:
-            self.valid.logical_and_(~state.grammar_enabled[safe, None].bool() | (prefix[None, :] == 0))
-        self.packed_top_k.copy_(torch.where(state.top_k[safe] > 0, state.top_k[safe], state.vocab_size)[:, None].expand_as(self.valid).reshape(-1))
-        self.packed_top_p.copy_(params[:, 1:2].expand_as(self.valid).reshape(-1))
+        indices = width - 1 + self.prefix_offset
+        has_cond_grammar = self.grammar_masks is not None
+        g_masks = self.grammar_masks if has_cond_grammar else state.grammar_mask[:, None, :]
+        g_counts = self.grammar_mask_count if has_cond_grammar else self.slots
+        n_rows = batch * width
+        torch.library.wrap_triton(_prepare_speculative_meta_kernel)[(n_rows,)](
+            safe, live, self.candidates, state.top_k, params, state.grammar_enabled, g_counts,
+            self.packed_top_k, self.packed_top_p, self.row_flags, self.maximum,
+            self.candidates.stride(0), params.stride(0),
+            width, vocab, self.prefix_offset, indices, g_masks.shape[1], has_cond_grammar,
+            num_warps=1)
+        block = 1024
+        torch.library.wrap_triton(_prepare_speculative_scores_kernel)[(n_rows, triton.cdiv(vocab, block))](
+            self.logits, state.histogram, self.candidates, safe, params, state.grammar_enabled, g_masks,
+            self.row_flags, self.scores, self.maximum,
+            self.logits.stride(0), self.logits.stride(1), state.histogram.stride(0),
+            self.candidates.stride(0), params.stride(0), g_masks.stride(0), g_masks.stride(1),
+            width, vocab, self.prefix_offset, indices, has_cond_grammar, write_dummy_invalid, block,
+            num_warps=4)
+        torch.library.wrap_triton(_finalize_speculative_valid_kernel)[(n_rows,)](
+            self.row_flags, self.valid, self.scores, self.maximum,
+            vocab, write_dummy_invalid, block, num_warps=4)
         return safe, params
 
     def prepare(self):
@@ -236,9 +330,7 @@ class PreparedSpeculativeDistributions:
     def __call__(self):
         if not self._prepared:
             raise RuntimeError("probability filtering requires prepare() before capture")
-        _, params = self.prepare_scores()
-        dummy = torch.where(self.vocab_ids == 0, 0., -torch.inf)
-        self.scores.copy_(torch.where(self.valid[:, :, None], self.scores, dummy))
+        _, params = self.prepare_scores(write_dummy_invalid=True)
         flat = self.scores.view(-1, self.state.vocab_size)
         filter_probabilities_out(flat, self.packed_top_k, self.packed_top_p,
             *self.library_scratch, self.probabilities.view_as(flat), self.top_p_workspace)

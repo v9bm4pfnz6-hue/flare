@@ -110,11 +110,17 @@ class PreparedScoreExchangeTopK:
         self.collective = PreparedAllGather(self.keys, self.gathered, runtime=runtime, session=session,
             coordinator=coordinator, name=name)
 
-    def __call__(self):
+    def collect(self):
         _pack_local_keys(self.indices, self.scores, self.keys)
         self.collective(self.keys)
+
+    def merge_result(self):
         self.share()
         return self.output
+
+    def __call__(self):
+        self.collect()
+        return self.merge_result()
 
 
 class PreparedDistributedTopK:
@@ -143,11 +149,17 @@ class PreparedDistributedTopK:
             self.gathered.view(torch.bfloat16).view(rows, -1), runtime=runtime, session=session,
             coordinator=coordinator, name=name)
 
-    def __call__(self):
+    def collect(self):
         _pack_local_candidates(self.indices, self.scores, self.local, self.rank, self.world)
         self.collective(self.local.view(torch.bfloat16).view(self.indices.shape[0], -1))
+
+    def merge_result(self):
         self.merge()
         return self.output
+
+    def __call__(self):
+        self.collect()
+        return self.merge_result()
 
 
 

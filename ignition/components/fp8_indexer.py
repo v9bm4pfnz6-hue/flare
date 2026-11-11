@@ -60,7 +60,7 @@ class PreparedFP8Indexer:
         declare(session, (self.query_plan.request(name=name + ".query",
             prepare_call=lambda state: PreparedCall(run=lambda: state.quantize(*self.query_arguments))),))
         self.pages = pages
-        self.packed_pages = pages if mode == "prefill" else buffers.zeros(pages.shape, torch.int32)
+        self.packed_pages = pages if (mode == "prefill" or pages.is_contiguous()) else buffers.zeros(pages.shape, torch.int32)
         caps = dsa_indexer.Caps(device=query.device, num_q_heads=heads, max_q_rows=rows,
             max_page_table_width=pages.shape[1], topk=output.shape[1], mode=mode,
             supertile_k=(min(prefill_records_per_call, pages.shape[1] * 64)
@@ -76,8 +76,7 @@ class PreparedFP8Indexer:
             slots, self.cache.stride(0), self.rotation == "hadamard", num_warps=4)
 
     def __call__(self):
-        self.scaled_weights.copy_(self.weights)
-        self.scaled_weights.mul_(self.weight_normalization)
+        torch.mul(self.weights, self.weight_normalization, out=self.scaled_weights)
         glm_pool.quantize_queries(*self.query_arguments, plan=self.query_plan)
         if self.packed_pages is not self.pages:
             self.packed_pages.copy_(self.pages)
